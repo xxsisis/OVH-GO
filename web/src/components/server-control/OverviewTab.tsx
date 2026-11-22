@@ -72,7 +72,7 @@ export function OverviewTab({ server }: { server: OwnedServer }) {
           </div>
         )}
 
-<div className="grid grid-cols-2 md:grid-cols-4 gap-2.5 sm:gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-x-2 gap-y-1 rounded-xl bg-muted/55 p-1.5 sm:p-2">
         <InfoCard icon={<Cpu className="w-4 h-4" />} label={t("maint.overview.info.cpu")} value={cpuText} loading={hw.isPending} />
         <InfoCard icon={<MemoryStick className="w-4 h-4" />} label={t("maint.overview.info.mem")} value={memText} loading={hw.isPending} />
         <InfoCard icon={<HardDrive className="w-4 h-4" />} label={t("maint.overview.info.disk")} value={diskText} loading={hw.isPending} />
@@ -82,8 +82,8 @@ export function OverviewTab({ server }: { server: OwnedServer }) {
       {/* 网络：IP 列表 + 接口 + MRTG 流量 */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
         {/* IP 列表 */}
-        <div className="border border-border rounded-2xl overflow-hidden">
-          <div className="px-4 py-3 border-b border-border flex items-center gap-2">
+        <div className="min-w-0 overflow-hidden">
+          <div className="px-1 pt-1 pb-3 border-b border-border flex items-center gap-2">
             <Globe className="w-4 h-4 text-muted-foreground" />
             <h3 className="text-sm font-semibold">{t("maint.overview.ipTitle")}</h3>
           </div>
@@ -92,9 +92,9 @@ export function OverviewTab({ server }: { server: OwnedServer }) {
               <Skeleton className="h-20 rounded-md" />
             </div>
           ) : (
-            <div className="divide-y divide-border">
+            <div className="divide-y divide-border/55">
               {(ips.data && ips.data.length > 0 ? ips.data : [{ ip: server.ip, type: "IPv4" }]).map((entry) => (
-                <div key={entry.ip} className="px-4 py-3 flex items-center justify-between text-[13px]">
+                <div key={entry.ip} className="px-1 py-2.5 flex items-center justify-between text-[13px]">
                   <code className="font-mono">{maskSensitive(entry.ip, hidden)}</code>
                   <span className="text-[11px] text-muted-foreground">{entry.type}</span>
                 </div>
@@ -104,8 +104,8 @@ export function OverviewTab({ server }: { server: OwnedServer }) {
         </div>
 
         {/* 网卡接口 */}
-        <div className="border border-border rounded-2xl overflow-hidden">
-          <div className="px-4 py-3 border-b border-border flex items-center gap-2">
+        <div className="min-w-0 overflow-hidden">
+          <div className="px-1 pt-1 pb-3 border-b border-border flex items-center gap-2">
             <Wifi className="w-4 h-4 text-muted-foreground" />
             <h3 className="text-sm font-semibold">{t("maint.overview.nicTitle")}</h3>
           </div>
@@ -125,9 +125,9 @@ export function OverviewTab({ server }: { server: OwnedServer }) {
                 what={t("maint.overview.nicPartialWhat")}
                 className="mx-4 mt-3"
               />
-              <div className="divide-y divide-border">
+              <div className="divide-y divide-border/55">
                 {(interfaces.data?.items || []).map((nic) => (
-                  <div key={nic.mac} className="px-4 py-3 flex items-center justify-between text-[13px]">
+                  <div key={nic.mac} className="px-1 py-2.5 flex items-center justify-between text-[13px]">
                     <code className="font-mono">{nic.mac}</code>
                     <span className="text-[11px] text-muted-foreground flex items-center gap-2">
                       <DetailErrorTag message={nic._detailError} />
@@ -160,8 +160,8 @@ function InfoCard({
 }) {
   // 仪器读数块(groove 凹槽底 + 大号读数)
   return (
-    <div className="border border-border rounded-xl px-3 sm:px-3.5 py-3 flex items-center gap-3 min-w-0">
-      <div className="hidden min-[400px]:flex w-9 h-9 rounded-lg bg-secondary items-center justify-center flex-shrink-0">{icon}</div>
+    <div className="px-2 sm:px-3 py-2.5 flex items-center gap-2.5 min-w-0">
+      <div className="hidden min-[400px]:flex w-8 h-8 rounded-full bg-card text-muted-foreground items-center justify-center flex-shrink-0">{icon}</div>
       <div className="min-w-0">
         <div className="text-[11px] text-muted-foreground">{label}</div>
         {loading ? (

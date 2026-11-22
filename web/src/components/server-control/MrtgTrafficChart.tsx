@@ -10,7 +10,6 @@ import {
   Tooltip,
   Legend,
 } from "recharts";
-import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/common/Skeleton";
@@ -67,8 +66,8 @@ export function MrtgTrafficChart({ serviceName }: { serviceName: string }) {
   }, [download, upload]);
 
   return (
-    <Card>
-      <CardContent className="p-5 space-y-4">
+    <section className="border-t border-border pt-5">
+      <div className="space-y-4">
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <div className="flex items-center gap-2">
             <Wifi className="w-4 h-4 text-muted-foreground" />
@@ -109,8 +108,8 @@ export function MrtgTrafficChart({ serviceName }: { serviceName: string }) {
             ))}
           </div>
         )}
-      </CardContent>
-    </Card>
+      </div>
+    </section>
   );
 }
 
@@ -168,7 +167,7 @@ function InterfaceChart({
   });
 
   return (
-    <div className="border border-border rounded-2xl p-4">
+    <div className="border-t border-border/60 pt-4">
       <div className="flex items-center gap-2 mb-3 flex-wrap">
         <Wifi className="w-4 h-4 text-muted-foreground" />
         <span className="text-[13px] font-semibold">{t("maint.mrtg.nicLabel")}</span>
@@ -188,16 +187,16 @@ function InterfaceChart({
       <div style={{ width: "100%", height: 320 }}>
         <ResponsiveContainer>
           <LineChart data={chartData} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" vertical={false} />
+            <CartesianGrid strokeDasharray="2 5" stroke="hsl(var(--border))" vertical={false} />
             <XAxis
               dataKey="time"
               stroke="hsl(var(--muted-foreground))"
               tickLine={false}
               axisLine={false}
               style={{ fontSize: 10 }}
-              angle={-45}
-              textAnchor="end"
-              height={70}
+              minTickGap={28}
+              tickMargin={8}
+              height={38}
             />
             <YAxis
               stroke="hsl(var(--muted-foreground))"
@@ -273,7 +272,7 @@ function StatBlock({
   const { t } = useTranslation();
   const toneText = tone === "success" ? "text-success" : "text-warning";
   return (
-    <div className={`border border-border rounded-xl p-3 ${toneText}`}>
+    <div className={`rounded-xl bg-muted/50 p-3.5 ${toneText}`}>
       <div className="flex items-center gap-1.5 text-[12px] font-semibold mb-2">
         {icon}
         {label}

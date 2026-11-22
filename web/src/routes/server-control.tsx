@@ -343,7 +343,7 @@ function ServerTabs({
       {/* 标题卡:系统图标 + 名称(多台时点开切换)+ 型号·机房·IP + 状态;下半部分是四格关键信息 */}
       <Card className="overflow-hidden">
         <div className="relative px-4 sm:px-6 pt-5 pb-4">
-          <div className="absolute inset-0 bg-gradient-to-r from-primary/[0.06] via-transparent to-transparent pointer-events-none" aria-hidden />
+          <div className="absolute inset-0 bg-gradient-to-r from-primary/[0.035] via-transparent to-transparent pointer-events-none" aria-hidden />
           <div className="relative flex flex-wrap sm:flex-nowrap items-start gap-x-4 gap-y-3">
             <span className="hidden sm:flex w-12 h-12 rounded-xl bg-card ring-1 ring-border shadow-sm items-center justify-center shrink-0">
               <OsIcon templateName={server.os || ""} size={26} />
@@ -421,7 +421,7 @@ function ServerTabs({
         </div>
 
         {/* 关键信息:能点的(续费、系统)带箭头;到期快到时变色;监控用开关 */}
-        <div className="grid grid-cols-2 lg:grid-cols-5 border-t border-border divide-x divide-y lg:divide-y-0 divide-border [&>*:nth-child(2n+1)]:border-l-0 lg:[&>*:nth-child(2n+1):not(:first-child)]:border-l">
+        <div className="grid grid-cols-2 lg:grid-cols-5 bg-muted/35 border-t border-border/60">
           {info.isPending ? (
             Array.from({ length: 5 }).map((_, i) => (
               <div key={i} className="px-4 sm:px-6 py-3.5">
