@@ -4,7 +4,8 @@
 #   2. 编辑 .env，至少把 API_SECRET_KEY 换成你自己的随机串
 #   3. docker compose up -d
 #
-# 更新： docker compose pull && docker compose up -d
+# GHCR 镜像更新：docker compose pull && docker compose up -d
+# 本地源码构建：docker compose up -d --build
 # 日志： docker compose logs -f
 # 停止： docker compose down          （数据留在 ./data，不会丢）
 #
@@ -13,7 +14,7 @@
 
 services:
   ovh-console:
-    image: ovh-go:local
+    image: ghcr.io/xxsisis/ovh-go:${OVH_GO_VERSION:-latest}
     build: .
     container_name: ovh-console
     restart: unless-stopped

@@ -27,7 +27,7 @@ COPY web/ ./
 RUN npm run build
 
 # ---- 3. 构建后端 ----
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS gobuild
+FROM --platform=$BUILDPLATFORM golang:1.26.0-alpine AS gobuild
 WORKDIR /app/server
 # 依赖单独一层：go.mod/go.sum 没变就命中缓存
 COPY server/go.mod server/go.sum ./
@@ -50,6 +50,12 @@ RUN VERSION="$(cat /app/VERSION)" && \
 
 # ---- 4. 运行时 ----
 FROM alpine:3.20
+
+LABEL org.opencontainers.image.source="https://github.com/xxsisis/OVH-GO" \
+      org.opencontainers.image.title="OVH-GO" \
+      org.opencontainers.image.licenses="AGPL-3.0" \
+      org.opencontainers.image.description="OVH Server Management and Auto Ordering Console"
+
 
 # ca-certificates：要访问 OVH / Telegram / GitHub 的 HTTPS
 # tzdata：日志和「检测时间」用的是本地时区，没有它容器里全是 UTC
