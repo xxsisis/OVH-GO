@@ -1,0 +1,205 @@
+package db
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+
+	"github.com/ovh-buy/server/internal/types"
+)
+
+type historyRow struct {
+	Duration       string         `db:"duration"`
+	ID             string         `db:"id"`
+	AccountID      string         `db:"account_id"`
+	TaskID         string         `db:"task_id"`
+	PlanCode       string         `db:"plan_code"`
+	Datacenter     string         `db:"datacenter"`
+	OptionsJSON    string         `db:"options"`
+	Status         string         `db:"status"`
+	OrderID        string         `db:"order_id"`
+	OrderURL       string         `db:"order_url"`
+	ErrorMessage   sql.NullString `db:"error_message"`
+	CouponWarning  string         `db:"coupon_warning"`
+	PurchaseTime   string         `db:"purchase_time"`
+	AttemptCount   int            `db:"attempt_count"`
+	ExpirationTime string         `db:"expiration_time"`
+	RetractionTime string         `db:"retraction_time"`
+	PriceJSON      sql.NullString `db:"price"`
+	OrderStatus    string         `db:"order_status"`
+	OrderStatusAt  string         `db:"order_status_at"`
+	TimingJSON     sql.NullString `db:"timing"`
+	TotalMs        int64          `db:"total_ms"`
+	DetectionUs    int64          `db:"detection_to_write_us"`
+	Prewarmed      int            `db:"prewarmed"`
+	ConnReused     int            `db:"connection_reused"`
+	WaitMs         int64          `db:"wait_ms"`
+}
+
+func rowToHistory(r historyRow) types.PurchaseHistoryEntry {
+	var opts []string
+	if r.OptionsJSON != "" {
+		_ = json.Unmarshal([]byte(r.OptionsJSON), &opts)
+	}
+	if opts == nil {
+		opts = []string{}
+	}
+	var price *types.PriceInfo
+	if r.PriceJSON.Valid && r.PriceJSON.String != "" {
+		var p types.PriceInfo
+		if err := json.Unmarshal([]byte(r.PriceJSON.String), &p); err == nil {
+			price = &p
+		}
+	}
+	var errMsg *string
+	if r.ErrorMessage.Valid {
+		s := r.ErrorMessage.String
+		errMsg = &s
+	}
+	// 抢购耗时以前只在内存里,重启就没了 —— 这里一并落库
+	var timing []types.PhaseTiming
+	if r.TimingJSON.Valid && r.TimingJSON.String != "" {
+		_ = json.Unmarshal([]byte(r.TimingJSON.String), &timing)
+	}
+	return types.PurchaseHistoryEntry{
+		ID:                 r.ID,
+		AccountID:          r.AccountID,
+		TaskID:             r.TaskID,
+		Duration:           r.Duration,
+		PlanCode:           r.PlanCode,
+		Datacenter:         r.Datacenter,
+		Options:            opts,
+		Status:             r.Status,
+		OrderID:            r.OrderID,
+		OrderURL:           r.OrderURL,
+		ErrorMessage:       errMsg,
+		CouponWarning:      r.CouponWarning,
+		PurchaseTime:       r.PurchaseTime,
+		AttemptCount:       r.AttemptCount,
+		ExpirationTime:     r.ExpirationTime,
+		RetractionTime:     r.RetractionTime,
+		Price:              price,
+		OrderStatus:        r.OrderStatus,
+		OrderStatusAt:      r.OrderStatusAt,
+		Timing:             timing,
+		TotalMs:            r.TotalMs,
+		DetectionToWriteUs: r.DetectionUs,
+		Prewarmed:          r.Prewarmed == 1,
+		ConnectionReused:   r.ConnReused == 1,
+		WaitMs:             r.WaitMs,
+	}
+}
+
+func historyToRow(h types.PurchaseHistoryEntry) (historyRow, error) {
+	if h.Options == nil {
+		h.Options = []string{}
+	}
+	optsJSON, err := json.Marshal(h.Options)
+	if err != nil {
+		return historyRow{}, err
+	}
+	row := historyRow{
+		ID:             h.ID,
+		AccountID:      h.AccountID,
+		TaskID:         h.TaskID,
+		Duration:       h.Duration,
+		PlanCode:       h.PlanCode,
+		Datacenter:     h.Datacenter,
+		OptionsJSON:    string(optsJSON),
+		Status:         h.Status,
+		OrderID:        h.OrderID,
+		OrderURL:       h.OrderURL,
+		CouponWarning:  h.CouponWarning,
+		PurchaseTime:   h.PurchaseTime,
+		AttemptCount:   h.AttemptCount,
+		ExpirationTime: h.ExpirationTime,
+		RetractionTime: h.RetractionTime,
+		OrderStatus:    h.OrderStatus,
+		OrderStatusAt:  h.OrderStatusAt,
+		TotalMs:        h.TotalMs,
+		DetectionUs:    h.DetectionToWriteUs,
+		Prewarmed:      boolInt(h.Prewarmed),
+		ConnReused:     boolInt(h.ConnectionReused),
+		WaitMs:         h.WaitMs,
+	}
+	if len(h.Timing) > 0 {
+		if tj, err := json.Marshal(h.Timing); err == nil {
+			row.TimingJSON = sql.NullString{String: string(tj), Valid: true}
+		}
+	}
+	if h.ErrorMessage != nil {
+		row.ErrorMessage = sql.NullString{String: *h.ErrorMessage, Valid: true}
+	}
+	if h.Price != nil {
+		priceJSON, err := json.Marshal(h.Price)
+		if err != nil {
+			return row, err
+		}
+		row.PriceJSON = sql.NullString{String: string(priceJSON), Valid: true}
+	}
+	return row, nil
+}
+
+// ListHistory 取全部抢购历史，按时间倒序
+func (db *DB) ListHistory() ([]types.PurchaseHistoryEntry, error) {
+	var rows []historyRow
+	if err := db.Select(&rows, `SELECT * FROM history ORDER BY purchase_time DESC`); err != nil {
+		return nil, fmt.Errorf("list history: %w", err)
+	}
+	out := make([]types.PurchaseHistoryEntry, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, rowToHistory(r))
+	}
+	return out, nil
+}
+
+// ReplaceHistory 全表覆盖（保留 ReplaceX API 一致）
+func (db *DB) ReplaceHistory(items []types.PurchaseHistoryEntry) error {
+	tx, err := db.Beginx()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM history`); err != nil {
+		return fmt.Errorf("clear history: %w", err)
+	}
+	for _, h := range items {
+		r, err := historyToRow(h)
+		if err != nil {
+			return err
+		}
+		_, err = tx.NamedExec(`
+			INSERT INTO history
+			(id, account_id, task_id, duration, plan_code, datacenter, options, status, order_id, order_url,
+			 error_message, purchase_time, attempt_count, expiration_time, retraction_time, price,
+			 order_status, order_status_at, timing, total_ms, coupon_warning,
+			 detection_to_write_us, prewarmed, connection_reused, wait_ms)
+			VALUES
+			(:id, :account_id, :task_id, :duration, :plan_code, :datacenter, :options, :status, :order_id, :order_url,
+			 :error_message, :purchase_time, :attempt_count, :expiration_time, :retraction_time, :price,
+			 :order_status, :order_status_at, :timing, :total_ms, :coupon_warning,
+			 :detection_to_write_us, :prewarmed, :connection_reused, :wait_ms)
+		`, r)
+		if err != nil {
+			return fmt.Errorf("insert history %s: %w", h.ID, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// ClearHistory 清空历史
+func (db *DB) ClearHistory() (int64, error) {
+	res, err := db.Exec(`DELETE FROM history`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// boolInt SQLite 用 0/1 存布尔值。
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}

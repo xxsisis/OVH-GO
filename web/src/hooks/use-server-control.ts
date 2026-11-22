@@ -1,0 +1,1906 @@
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useAccountApi } from "@/hooks/use-account-api";
+import { toast } from "sonner";
+import i18n from "@/i18n";
+import { qk, accountQueryKey } from "@/lib/query";
+import { apiMessage, bodyMessage } from "@/lib/api-error";
+import type { PartialList } from "./partial-list";
+import { useAccountScope } from "@/hooks/use-account";
+
+export interface OwnedServer {
+  serviceName: string;
+  name: string;
+  commercialRange: string;
+  datacenter: string;
+  state: string;
+  status?: string;
+  ip: string;
+  os: string;
+  orderId?: string | number;
+  reverse?: string;
+  monitoring?: boolean;
+  professionalUse?: boolean;
+  bootId?: number | null;
+  /**
+   * 列表接口里的自动续费状态。
+   * true=已开自动续费 / false=确实没开 / null|undefined=这次没查到。
+   * 三态必须分开渲染：把 null 当成 false 显示成「手动」会让用户以为自己已经关过了，
+   * 实际上机器可能正在自动续费（或反过来漏续费），这正是后端改用 *bool 的原因。
+   */
+  renewalType?: boolean | null;
+  /** 有值表示这台机器的 serviceInfos 没拉到（renewalType/status 因此不可信），组件应提示可重试 */
+  svcInfoError?: string;
+  /** 有值表示这台机器连详情都没拉到，除 serviceName/name 外其它字段都缺 */
+  error?: string;
+  /** 中奖摘要(后端 1h 缓存,只有确实中奖的机器才带)。徽章用,详情在概览页 */
+  lottery?: { won: boolean; tier?: number };
+}
+
+export interface HardwareInfo {
+  processorName: string;
+  processorArchitecture: string;
+  coresPerProcessor: number;
+  threadsPerProcessor: number;
+  memorySize?: { value: number; unit: string };
+  diskGroups?: any[];
+  expansionCards?: any[];
+}
+
+/** 硬件"中奖"检测结果:订购配置 ≠ 机房实际交付(且实际更好) */
+export interface HardwareLottery {
+  /** false = 没拿到订购配置(权限/老合同),不显示任何中奖标识 */
+  checked: boolean;
+  won: boolean;
+  /** 1=中奖 2=大奖 3=头奖(中奖项数 + 翻倍加成,后端算好) */
+  tier?: number;
+  planCode?: string;
+  planName?: string;
+  items: Array<{
+    kind: "cpu" | "memory" | "disk";
+    ordered: string;
+    actual: string;
+    /** 量化涨幅(%),0/缺省 = 算不出来 */
+    gainPct?: number;
+    /** 硬盘介质升级(HDD→SSD→NVMe) */
+    mediaUp?: boolean;
+  }>;
+  reason?: string;
+}
+
+export interface ServiceInfo {
+  status: string;
+  expiration: string;
+  creation: string;
+  /**
+   * 是否启用自动续费(后端解析 OVH renew.automatic)。
+   * 这里是单台机器的 /serviceinfo 接口，后端拿不到 renew 就整个请求报错，
+   * 不会像列表接口那样出现 null，所以保持 boolean —— 别跟 OwnedServer.renewalType 混淆。
+   */
+  renewalType: boolean;
+  /** 续费周期,单位月(1 / 3 / 6 / 12 等) */
+  renewalPeriod: number;
+  /** 到期是否自动删除服务 —— true 等于"到期断网回收" */
+  renewalDeleteAtExpiration: boolean;
+  /** 终止状态的权威来源:GET /services/{id} 的 lifecycle.pendingActions。
+   *  旧字段 renewalDeleteAtExpiration 会不会随 terminationPolicy 同步,OVH 文档没说,
+   *  显示"当前是不是到期终止"以这个为准。读不到时后端不下发,前端回退旧字段。 */
+  terminationScheduled?: boolean;
+  /** 具体是哪种终止(services.expanded.Lifecycle.ActionEnum):
+   *  terminate=立即终止处理中 / terminateAtExpirationDate=到期终止 /
+   *  terminateAtEngagementDate=合同期结束终止 / deleteAtExpiration=到期注销。
+   *  「立即」和「到期」后果天差地别,不能都显示成"到期终止" */
+  terminationAction?: string;
+  /** 读 lifecycle 失败 —— 此时旧字段没有验证过,必须显示"状态未知"而不是假装知道 */
+  terminationStateUnknown?: boolean;
+  terminationDate?: string;
+  /** OVH 是否强制自动续费(部分付费服务) */
+  renewalForced: boolean;
+  /** 是否要求手动支付(true 时余额扣款会跳过,需用户手动付) */
+  renewalManualPayment: boolean;
+  /** 仅由该服务的续费能力判断,不能按账户地区推断。 */
+  renewalManualUnsupported?: boolean;
+  /** GET /services/{id} 的 billing.renew.capacities.mode;未取得时保持未知。 */
+  renewalModes?: string[];
+  /** OVH 允许的续费周期列表(月数),前端 select 选项用 */
+  possibleRenewPeriod: number[];
+}
+
+/**
+ * 已购服务器列表（后端返回 { success, servers, total }）
+ * 过滤逻辑照搬旧前端：只显示 state === 'ok' | 'active'，排除 expired / suspended / error
+ */
+export function useOwnedServers() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: qk.serverControl.list(accountId),
+    queryFn: async () => {
+      const res = await api.get("/server-control/list");
+      const raw = (res.data?.servers || []) as OwnedServer[];
+      return raw.filter((s) => {
+        const state = s.state?.toLowerCase();
+        // 后端对详情拉挂的行返回 {serviceName, name, error} 占位 —— 必须放行,
+        // 否则机器从列表直接消失(既不是失败标记也不是机器,用户以为机器没了)
+        if (s.error) return true;
+        const status = s.status?.toLowerCase();
+        if (status === "expired" || status === "suspended") return false;
+        if (state === "error" || state === "suspended") return false;
+        return state === "ok" || state === "active";
+      });
+    },
+    staleTime: 60_000,
+  });
+}
+
+/** /server-control/{sn}/hardware 的完整响应:硬件信息 + 中奖检测一次带回 */
+interface HardwareEnvelope {
+  success: boolean;
+  hardware: HardwareInfo | null;
+  lottery: HardwareLottery | null;
+}
+
+// 中奖检测和硬件信息来自同一个接口,两个 hook 必须共享同一次请求。
+// queryKey 相同的 query 全局只有一份缓存、只跑一个 queryFn —— 以前两个 hook
+// 各带各的 queryFn 又共用同一个 key,先挂载的 useServerHardware 把缓存写成了
+// 纯 HardwareInfo,useHardwareLottery 再读同一份缓存,.checked 永远是 undefined,
+// 中奖横幅一次都不会显示。改成共用 queryFn + 各自 select 投影:一份缓存各取所需。
+function useHardwareQuery<T>(serviceName: string | null, select: (d: HardwareEnvelope) => T) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.hardware(serviceName || ""), accountId),
+    queryFn: async (): Promise<HardwareEnvelope> => {
+      const res = await api.get(`/server-control/${serviceName}/hardware`);
+      return res.data as HardwareEnvelope;
+    },
+    enabled: !!serviceName,
+    staleTime: 60_000,
+    select,
+  });
+}
+
+/** 硬件"中奖"检测结果(后端 hardware 接口附带) */
+export function useHardwareLottery(serviceName: string | null) {
+  return useHardwareQuery(serviceName, (d) => d?.lottery || null);
+}
+
+/** 硬件信息（后端返回 { success, hardware: {...} }） */
+export function useServerHardware(serviceName: string | null) {
+  return useHardwareQuery(serviceName, (d) => d?.hardware || null);
+}
+
+
+/** 续费价格(主机 + 附加选项,不含税)与目录安装费(只读) */
+export interface ServerPricing {
+  planCode?: string;
+  renewal?: { amount: number; currency: string; duration: string; interval: number; base: number; options: number; partial: boolean };
+  installation?: { ok: boolean; amount?: number; tax?: number; currency?: string; reason?: string; partial?: boolean };
+}
+
+export function useServerPricing(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.pricing(serviceName || ""), accountId),
+    queryFn: async () => (await api.get<ServerPricing>(`/server-control/${serviceName}/pricing`)).data,
+    enabled: !!serviceName,
+    staleTime: 10 * 60_000,
+    retry: false,
+  });
+}
+
+/** 启动状态:救援模式还是正常启动,以及设置是否已在运行中生效(只读) */
+export interface BootState {
+  bootId: number;
+  bootType: string;
+  description?: string;
+  powerState?: string;
+  state?: string;
+  /** rebooting 正在重启 / active 已生效 / pending 已改但未重启 / unknown 无法确认 */
+  effect: "rebooting" | "active" | "pending" | "unknown";
+  reboot?: { status?: string; startDate?: string; doneDate?: string };
+  changedAt?: string;
+}
+
+export function useServerBootState(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.bootState(serviceName || ""), accountId),
+    queryFn: async () => (await api.get<BootState>(`/server-control/${encodeURIComponent(serviceName!)}/boot-state`)).data,
+    enabled: !!serviceName,
+    staleTime: 30_000,
+    retry: false,
+    // 正在重启或等待重启时每 20 秒刷新,重启完成后自动变成已生效
+    refetchInterval: (q) => {
+      const e = (q.state.data as BootState | undefined)?.effect;
+      return e === "rebooting" || e === "pending" ? 20_000 : false;
+    },
+  });
+}
+
+/** 服务信息（后端返回 { success, serviceInfo: {...} }） */
+export function useServerServiceInfo(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.serviceInfo(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/serviceinfo`);
+      return (res.data?.serviceInfo || null) as ServiceInfo | null;
+    },
+    enabled: !!serviceName,
+  });
+}
+
+/**
+ * 修改续费策略。OVH 这个 endpoint 需要 PUT 整个 service 对象,
+ * 后端代为 GET + merge + PUT,前端只传 mode + 可选 period。
+ */
+export function useUpdateRenewal(serviceName: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { mode: "auto" | "manual" | "delete"; period?: number }) => {
+      const res = await api.put(`/server-control/${serviceName}/serviceinfo/renewal`, vars);
+      return res.data;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.serviceInfo(serviceName), accountId) });
+      // 列表行带 renewalType(60s staleTime),不失效会继续显示旧模式
+      qc.invalidateQueries({ queryKey: ["server-control", "list"] });
+    },
+  });
+}
+
+/* ──────────── 到期终止策略 ──────────── */
+
+/** 终止状态的显示信息。四种 pendingAction 后果完全不同,必须分开说。 */
+export function terminationLabel(info: {
+  terminationScheduled?: boolean;
+  terminationAction?: string;
+  terminationStateUnknown?: boolean;
+  renewalDeleteAtExpiration?: boolean;
+}): { text: string; danger: boolean; title: string } | null {
+  // 读失败:不要用没验证过的旧字段冒充真相。销毁级状态宁可说"不知道"
+  if (info.terminationStateUnknown) {
+    return {
+      text: i18n.t("hooksMsg.server.termination.unknownText"),
+      danger: true,
+      title: i18n.t("hooksMsg.server.termination.unknownTitle"),
+    };
+  }
+  const on = info.terminationScheduled ?? info.renewalDeleteAtExpiration;
+  if (!on) return null;
+  switch (info.terminationAction) {
+    case "terminate":
+      return {
+        text: i18n.t("hooksMsg.server.termination.immediateText"),
+        danger: true,
+        title: i18n.t("hooksMsg.server.termination.immediateTitle"),
+      };
+    case "terminateAtEngagementDate":
+      return {
+        text: i18n.t("hooksMsg.server.termination.engagementText"),
+        danger: false,
+        title: i18n.t("hooksMsg.server.termination.engagementTitle"),
+      };
+    case "terminateAtExpirationDate":
+    case "deleteAtExpiration":
+      return {
+        text: i18n.t("hooksMsg.server.termination.expirationText"),
+        danger: false,
+        title: i18n.t("hooksMsg.server.termination.expirationTitle"),
+      };
+    default:
+      // scheduled=true 但拿不到具体 action(比如走了旧字段兜底)
+      return {
+        text: i18n.t("hooksMsg.server.termination.scheduledText"),
+        danger: false,
+        title: i18n.t("hooksMsg.server.termination.scheduledTitle"),
+      };
+  }
+}
+
+/**
+ * 设置终止策略。
+ *
+ * **不要**用 POST /terminate —— 那是「立即终止」，提交后 OVH 当场把服务器暂停，
+ * 并邮件通知「5 天内不付款就彻底清除硬盘数据」。这个坑真实踩过一次。
+ *
+ * OVH 的生命周期动作枚举把两件事分得很清楚：
+ *   terminate                  立即终止
+ *   terminateAtExpirationDate  到期终止（用到当期结束）
+ * 到期终止只能通过 PUT /services/{serviceId} 的 terminationPolicy 设置。
+ *
+ * policy 取值：
+ *   empty                      不终止 / 撤销已提交的到期终止
+ *   terminateAtExpirationDate  到期日终止
+ *   terminateAtEngagementDate  合同期结束时终止
+ */
+export function useUpdateTerminationPolicy(serviceName: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { policy: string }) =>
+      (await api.put(`/server-control/${serviceName}/termination-policy`, vars)).data as {
+        success: boolean;
+        message: string;
+      },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.serviceInfo(serviceName), accountId) });
+    },
+  });
+}
+
+/* ──────────── Engagement(合同期切换) ──────────── */
+
+export interface EngagementPricing {
+  pricingMode: string;
+  description: string;
+  duration: string;
+  interval: number;
+  price: { value: number; currencyCode?: string; text?: string };
+  priceInUcents?: number;
+  engagementConfiguration?: {
+    defaultEndAction: string;
+    duration: string;
+    type: string;
+  };
+}
+
+export interface EngagementInfo {
+  currentPeriod?: { startDate: string; endDate: string };
+  endRule?: { strategy: string; possibleStrategies: string[] };
+}
+
+export interface EngagementRequest {
+  pricing?: EngagementPricing;
+  requestDate?: string;
+  order?: { orderId?: number; url?: string };
+}
+
+/** 当前 engagement(无合同期返回 null) */
+export function useEngagement(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.engagement(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/engagement`);
+      return (res.data?.engagement || null) as EngagementInfo | null;
+    },
+    enabled: !!serviceName,
+  });
+}
+
+/** 可订购的 engagement 选项列表 */
+export function useEngagementAvailable(serviceName: string | null, enabled = true) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.engagementAvailable(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/engagement/available`);
+      return (res.data?.pricings || []) as EngagementPricing[];
+    },
+    enabled: !!serviceName && enabled,
+  });
+}
+
+/** 进行中的 engagement 变更请求 */
+export function useEngagementRequest(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.engagementRequest(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/engagement/request`);
+      return (res.data?.request || null) as EngagementRequest | null;
+    },
+    enabled: !!serviceName,
+  });
+}
+
+/** 提交新的 engagement 请求 */
+export function useCreateEngagementRequest(serviceName: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { pricingMode: string }) => {
+      const res = await api.post(`/server-control/${serviceName}/engagement/request`, vars);
+      return res.data;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.engagement(serviceName), accountId) });
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.engagementRequest(serviceName), accountId) });
+    },
+  });
+}
+
+/** 撤销进行中的 engagement 请求 */
+export function useDeleteEngagementRequest(serviceName: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const res = await api.delete(`/server-control/${serviceName}/engagement/request`);
+      return res.data;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.engagementRequest(serviceName), accountId) });
+    },
+  });
+}
+
+/** services.billing.engagement.EndStrategyEnum，后端也按这份白名单校验 */
+export type EngagementEndStrategy =
+  | "CANCEL_SERVICE"
+  | "REACTIVATE_ENGAGEMENT"
+  | "STOP_ENGAGEMENT_FALLBACK_DEFAULT_PRICE"
+  | "STOP_ENGAGEMENT_KEEP_PRICE";
+
+/**
+ * 改 engagement 到期策略。
+ * CANCEL_SERVICE = 承诺期结束后直接销毁服务器，不可撤销，所以后端要求带 confirm:true；
+ * 组件必须先弹二次确认框拿到用户明确同意，再传 confirm。其余三个策略不需要 confirm。
+ */
+export function useUpdateEngagementEndRule(serviceName: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { strategy: EngagementEndStrategy | string; confirm?: boolean }) => {
+      const res = await api.put(`/server-control/${serviceName}/engagement/end-rule`, vars);
+      return res.data;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.engagement(serviceName), accountId) });
+    },
+  });
+}
+
+/* ──────────── DDoS Mitigation ──────────── */
+
+export interface MitigationIp {
+  ipOnMitigation: string;
+  state: string; // activated / pending / disabled / ...
+  auto: boolean;
+  permanent: boolean;
+}
+
+export interface MitigationBlock {
+  ipBlock: string;
+  mitigations: MitigationIp[];
+  error?: string;
+}
+
+export function useMitigation(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.mitigation(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/mitigation`);
+      return (res.data?.ips || []) as MitigationBlock[];
+    },
+    enabled: !!serviceName,
+    // 过渡态自动轮询(creationPending/removalPending → ok 通常 30 秒-2 分钟)
+    refetchInterval: (q) => {
+      const data = q.state.data as MitigationBlock[] | undefined;
+      if (!data) return false;
+      const hasTransition = data.some((b) =>
+        b.mitigations.some((m: any) => m.state === "creationPending" || m.state === "removalPending"),
+      );
+      return hasTransition ? 5000 : false;
+    },
+  });
+}
+
+export function useEnableMitigation(serviceName: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { ip: string; block: string }) => {
+      const res = await api.post(`/server-control/${serviceName}/mitigation/${vars.ip}?block=${encodeURIComponent(vars.block)}`);
+      return res.data;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.mitigation(serviceName), accountId) });
+    },
+  });
+}
+
+export function useDisableMitigation(serviceName: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { ip: string; block: string }) => {
+      const res = await api.delete(`/server-control/${serviceName}/mitigation/${vars.ip}?block=${encodeURIComponent(vars.block)}`);
+      return res.data;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.mitigation(serviceName), accountId) });
+    },
+  });
+}
+
+/** IP 列表（后端返回 { success, ips: [{ ip, type, ... }] }） */
+export function useServerIps(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.ips(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/ips`);
+      return (res.data?.ips || []) as Array<{ ip: string; type: string }>;
+    },
+    enabled: !!serviceName,
+  });
+}
+
+/** 维护记录（后端返回 { success, interventions: [...] }） */
+export function useServerInterventions(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.interventions(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/interventions`);
+      return (res.data?.interventions || []) as any[];
+    },
+    enabled: !!serviceName,
+  });
+}
+
+/**
+ * 后端「主键列表 + 并发拉详情」类接口的统一读法：
+ * 详情拉挂的行仍会返回，只是带 _detailError；partial/failedCount 说明这次少了几行的详情。
+ */
+function readPartialList<T>(data: any, listKey: string): PartialList<T> {
+  const failedCount = Number(data?.failedCount) || 0;
+  return {
+    items: (data?.[listKey] || []) as T[],
+    partial: data?.partial === true || failedCount > 0,
+    failedCount,
+  };
+}
+
+/** 详情拉取失败的行会带上这个字段，组件应给该行加「获取失败」标记 */
+export interface DetailErrorMarked {
+  _detailError?: string;
+}
+
+export interface NetworkInterface extends DetailErrorMarked {
+  mac: string;
+  linkType?: string;
+}
+
+/** 网络接口（后端返回 { success, interfaces, partial, failedCount }） */
+export function useServerNetworkInterfaces(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.networkInterfaces(serviceName || ""), accountId),
+    queryFn: async (): Promise<PartialList<NetworkInterface>> => {
+      const res = await api.get(`/server-control/${serviceName}/network-interfaces`);
+      return readPartialList<NetworkInterface>(res.data, "interfaces");
+    },
+    enabled: !!serviceName,
+  });
+}
+
+export interface BootMode {
+  id: number;
+  bootType: string;
+  description: string;
+  kernel: string;
+  active: boolean;
+  /**
+   * 有值表示这一项的详情没拉到（bootType/description/kernel 是占位值）。
+   * 后端保留占位而不是丢条目，就是为了别让启动模式凭空少几个；
+   * 组件应把这一行标成「获取失败，可重试」并禁止直接切换过去。
+   * 后端另有 failed 计数，等于带 error 的行数。
+   */
+  error?: string;
+}
+
+/** 启动模式（后端返回 { success, bootModes: [...] }） */
+export function useServerBootModes(serviceName: string | null, enabled = true) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.bootModes(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/boot-mode`);
+      return (res.data?.bootModes || []) as BootMode[];
+    },
+    enabled: !!serviceName && enabled,
+  });
+}
+
+/** 切换启动模式（旧前端会随后自动调 reboot；这里把 reboot 留给调用方决定） */
+export function useSetServerBootMode() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ serviceName, bootId }: { serviceName: string; bootId: number }) => {
+      const res = await api.put(`/server-control/${serviceName}/boot-mode`, { bootId });
+      return res.data;
+    },
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.bootModes(vars.serviceName), accountId) });
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.bootState(vars.serviceName), accountId) });
+    },
+  });
+}
+
+export interface ServerTask {
+  taskId: number;
+  function: string;
+  status: string;
+  startDate: string;
+  doneDate: string;
+  comment?: string;
+  /**
+   * 有值表示这条任务的详情没拉到（function/status 是占位值 N/A / unknown）。
+   * 不显示的话用户会以为任务真的处于 unknown 状态，从而重复提交同一个操作。
+   * 后端另有 failed 计数，等于带 error 的行数。
+   */
+  error?: string;
+}
+
+/** 服务器运维任务列表（后端返回 { success, tasks: [...] }） */
+export function useServerTasks(serviceName: string | null, enabled = true) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.tasks(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/tasks`);
+      return (res.data?.tasks || []) as ServerTask[];
+    },
+    enabled: !!serviceName && enabled,
+  });
+}
+
+export interface OSTemplate {
+  templateName: string;
+  distribution: string;
+  family: string;
+  bitFormat: number;
+  /** 官方 installationTemplate 元数据(可选:详情拉失败时缺省) */
+  filesystems?: string[];
+  lvmReady?: boolean;
+  noPartitioning?: boolean;
+  softRaidOnlyMirroring?: boolean;
+  customizeQuestions?: Array<{
+    name: string;
+    description?: string;
+    required?: boolean;
+    type?: string;
+  }>;
+}
+
+/**
+ * OS 模板列表（每台机器可用模板不同）（后端返回 { success, templates: [...] }）
+ * 长期缓存：localStorage 持久化 + staleTime/gcTime 永不过期，
+ * 只有用户点"刷新"才会重新拉取（dialog 里手动 refetch）。
+ */
+const TEMPLATES_LS_PREFIX = "ovh_sniper_templates_";
+export function useServerTemplates(serviceName: string | null, enabled = true) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const lsKey = serviceName && accountId ? TEMPLATES_LS_PREFIX + JSON.stringify([accountId, serviceName]) : "";
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.osTemplates(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/templates`);
+      const list = res.data?.templates;
+      if (!Array.isArray(list) || !list.every((item: unknown) => item && typeof item === "object" && typeof (item as OSTemplate).templateName === "string")) {
+        throw new Error(i18n.t("commons.templateResponseInvalid"));
+      }
+      if (lsKey) {
+        try {
+          localStorage.setItem(lsKey, JSON.stringify(list));
+          localStorage.setItem(lsKey + "_at", String(Date.now()));
+        } catch { /* 配额满或隐私模式 */ }
+      }
+      return list;
+    },
+    initialData: () => {
+      if (!lsKey) return undefined;
+      try {
+        const raw = localStorage.getItem(lsKey);
+        const list = raw ? JSON.parse(raw) : undefined;
+        return Array.isArray(list) && list.every(item => item && typeof item.templateName === "string") ? list as OSTemplate[] : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+    initialDataUpdatedAt: () => {
+      if (!lsKey) return undefined;
+      try {
+        const at = localStorage.getItem(lsKey + "_at");
+        const timestamp = Number(at);
+        return at && Number.isFinite(timestamp) && timestamp > 0 ? timestamp : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+    enabled: !!serviceName && enabled,
+    staleTime: Infinity,
+    gcTime: Infinity,
+    refetchOnMount: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
+}
+
+/** 硬件磁盘组（用于自定义 RAID / 分区）（后端返回 { success, diskGroups: { [id]: {...} } }） */
+export interface DiskGroupDisk {
+  number: number;
+  capacity: number;
+  unit: string;
+  technology?: string;
+  interface?: string;
+  /** OVH dedicated.server.DiskTypeEnum:NVMe / SSD / SAS / SATA / Unknown */
+  diskType?: string;
+}
+export interface DiskGroup {
+  raidController?: string;
+  disks: DiskGroupDisk[];
+  /** 后端一直在发这个字段(server_control_hardware.go),只是类型里漏了声明。
+   *  它是区分 SSD 和机械盘的唯一依据 —— 混合盘要靠它决定系统装哪一组。 */
+  diskType?: string;
+  description?: string;
+  id?: number;
+}
+
+export function useServerDiskInfo(serviceName: string | null, enabled = true) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.diskInfo(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/hardware-disk-info`);
+      return (res.data?.diskGroups || {}) as Record<string, DiskGroup>;
+    },
+    enabled: !!serviceName && enabled,
+    staleTime: 5 * 60_000,
+  });
+}
+
+/** 硬件 RAID 支持情况（后端返回 { success, supported, profiles }） */
+export function useServerRaidProfiles(serviceName: string | null, enabled = true) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.raidProfiles(serviceName || ""), accountId),
+    queryFn: async () => {
+      try {
+        const res = await api.get(`/server-control/${serviceName}/hardware-raid-profiles`);
+        return {
+          supported: res.data?.supported !== false,
+          profiles: (res.data?.profiles || []) as any[],
+        };
+      } catch (e: any) {
+        // 404 / 501 = OVH 明确回答"这台机器没有硬件 RAID 控制器",这是业务事实,照常返回 supported:false。
+        // 其余(断网 / 5xx / 超时)是"我们没问到",必须抛出去让 isError 生效。
+        // 以前一律 catch 成 supported:false,isError 结构上永远是 false,重装对话框于是在读失败时
+        // 也斩钉截铁地写「此服务器不支持硬件 RAID」—— 用户照着改用软 RAID,按下的是不可逆的重装。
+        const status = e?.response?.status;
+        if (status === 404 || status === 501) {
+          return { supported: false, profiles: [] as any[] };
+        }
+        throw e;
+      }
+    },
+    enabled: !!serviceName && enabled,
+    staleTime: 5 * 60_000,
+  });
+}
+
+/** 分区方案列表（每个模板的内置方案）（后端返回 { success, schemes: [...] }） */
+export interface PartitionScheme {
+  name: string;
+  priority: number;
+}
+export function useServerPartitionSchemes(serviceName: string | null, templateName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.partitionSchemes(serviceName || "", templateName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(
+        `/server-control/${serviceName}/partition-schemes?templateName=${encodeURIComponent(templateName || "")}`
+      );
+      return (res.data?.schemes || []) as PartitionScheme[];
+    },
+    enabled: !!serviceName && !!templateName,
+    staleTime: 5 * 60_000,
+  });
+}
+
+/** 自定义分区一行（前端模型，提交时再转 OVH layout） */
+export interface CustomPartition {
+  mountpoint: string;
+  filesystem: string;
+  size: number; // MB，0 表示剩余
+  order: number;
+  type: string;
+  raid?: string; // raid0/raid1/...
+  diskGroupId?: number;
+  /** 官方 extras.lv.name:LVM 逻辑卷名(同 RAID 的 LV 后端自动同 VG) */
+  lvName?: string;
+  /** 官方 extras.zp.name:ZFS zpool 名(同名数据集合并同一 zpool) */
+  zpoolName?: string;
+}
+
+/** 重装系统：完整版（template / hostname / Proxmox ZFS / 硬件 RAID / 软 RAID / 自定义分区 / 内置分区方案） */
+export interface ReinstallArgs {
+  serviceName: string;
+  templateName: string;
+  customHostname?: string;
+  /** OS 特定定制(官方 customizeQuestions 的答案:sshKey / postInstallationScript / language / enableLacpBonding…) */
+  customizations?: Record<string, string | boolean>;
+  /** 非安装盘组的保留声明(官方 Data erasure:erase:false 保留该组数据) */
+  keepDiskGroups?: number[];
+  /** 软 RAID 参与磁盘数(官方 partitioning.disks;空 = 全部盘) */
+  softwareRaidDisks?: number;
+  /** 硬件 RAID arrays(RAID10 阵列数)/ spares(热备盘数) */
+  hwRaidArrays?: number;
+  hwRaidSpares?: number;
+  // Proxmox 9 + ZFS（仅当 templateName === 'proxmox9_64' 时）
+  useProxmox9Zfs?: boolean;
+  zfsRaidLevel?: 0 | 1;
+  zfsVzSize?: number; // MB
+  // 老路径：选择某个内置分区方案
+  partitionSchemeName?: string;
+  // 新路径：自定义存储（硬件 RAID + 软 RAID + 分区）
+  hardwareRaid?: Record<number, string>; // diskGroupId → raidLevel (raid0/...)
+  softwareRaidLevel?: string; // 仅当 useSoftwareRaid 为 true 时
+  useSoftwareRaid?: boolean;
+  customPartitions?: CustomPartition[];
+  diskGroups?: Record<string, DiskGroup>; // 用于硬件 RAID 时拼 disks 列表
+}
+
+export interface ReinstallResult {
+  success: boolean;
+  message?: string;
+  taskId?: number;
+  /**
+   * 后端忽略了哪份存储配置的说明（例如同时勾了 Proxmox 9 + ZFS 和高级存储配置时，
+   * ZFS 预设优先、另一份被忽略）。装是能装成的，但用户得知道自己填的东西没生效，
+   * 组件应该用 toast.warning 逐条显示。
+   */
+  warnings?: string[];
+}
+
+export function useReinstallServer() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useMutation({
+    mutationFn: async (args: ReinstallArgs) => {
+      const installData: any = {
+        templateName: args.templateName,
+        customHostname: args.customHostname || undefined,
+        customizations: args.customizations && Object.keys(args.customizations).length > 0 ? args.customizations : undefined,
+        useProxmox9Zfs: !!args.useProxmox9Zfs,
+        zfsRaidLevel: args.useProxmox9Zfs ? args.zfsRaidLevel : undefined,
+        zfsVzSize: args.useProxmox9Zfs ? args.zfsVzSize : undefined,
+      };
+
+      const useCustom = !!(
+        args.useSoftwareRaid ||
+        (args.hardwareRaid && Object.values(args.hardwareRaid).some((v) => !!v)) ||
+        (args.customPartitions && args.customPartitions.length > 0)
+      );
+
+      if (useCustom) {
+        // 按 diskGroupId 分组
+        const groups = new Map<string, any>();
+        let partitions = args.customPartitions || [];
+        // 启用软 RAID 但未自定义分区 → 默认根分区软 RAID
+        if (args.useSoftwareRaid && partitions.length === 0) {
+          partitions = [
+            {
+              mountpoint: "/",
+              filesystem: "ext4",
+              size: 0,
+              order: 1,
+              type: "primary",
+              raid: args.softwareRaidLevel || "raid1",
+            },
+          ];
+        }
+        // 磁盘组编号从 1 起（官方分区文档：默认装在 diskGroupId 1 上），
+        // 而且文档写明「the API only supports OS installation and storage
+        // customisation on 1 single disk group」—— 所以没显式选组时用 0 当键
+        // 会造出一个不存在的组，还会把分区和硬件 RAID 拆成两个 storage 条目，
+        // 变成「在 0 组上分区、在 1 组上做 RAID」这种 OVH 不接受的配置。
+        // 用 undefined 当键表示「没选，交给 OVH 用默认组」，发送时也不带这个字段。
+        const DEFAULT_GID = "default";
+        const gidKey = (v?: number) => (v && v > 0 ? String(v) : DEFAULT_GID);
+        // 官方 partitioning.disks:软 RAID 只用前 N 块盘(不填 = 全部盘参与)。
+        // 单盘装系统、其余盘留给数据这类布局的唯一开关
+        if (args.useSoftwareRaid && args.softwareRaidDisks && args.softwareRaidDisks > 0) {
+          const dgid = groups.has(DEFAULT_GID) ? DEFAULT_GID : groups.keys().next().value as string;
+          const g0 = groups.get(dgid);
+          if (g0 && g0.partitioning) g0.partitioning.disks = args.softwareRaidDisks;
+        }
+        partitions.forEach((p) => {
+          const gid = gidKey(p.diskGroupId);
+          if (!groups.has(gid)) {
+            const entry: any = { partitioning: { layout: [] } };
+            if (gid !== DEFAULT_GID) entry.diskGroupId = Number(gid);
+            groups.set(gid, entry);
+          }
+          const g = groups.get(gid);
+          const ovhP: any = { mountPoint: p.mountpoint, fileSystem: p.filesystem, size: p.size || 0 };
+          if (p.raid) {
+            const m = p.raid.match(/raid(\d+)/);
+            if (m) ovhP.raidLevel = parseInt(m[1]);
+          }
+          // 官方 extras:lv = LVM 逻辑卷名(后端自动把同 RAID 的 LV 归进同一 VG);
+          // zp = ZFS zpool 名(同名数据集同池,便于高级特性隔离 /boot)
+          if (p.lvName?.trim()) ovhP.extras = { ...(ovhP.extras || {}), lv: { name: p.lvName.trim() } };
+          if (p.filesystem === "zfs" && p.zpoolName?.trim()) {
+            ovhP.extras = { ...(ovhP.extras || {}), zp: { name: p.zpoolName.trim() } };
+          }
+          g.partitioning.layout.push(ovhP);
+        });
+        // 硬件 RAID。
+        // schema dedicated.server.reinstall.storage.HardwareRaid 只有 arrays / disks(long) / raidLevel / spares：
+        // disks 是「参与阵列的磁盘数量」而不是磁盘编号数组，mode / name / step 是旧 partitionScheme 的字段，
+        // 不在 schema 里。后端虽然做了兼容映射，但继续发旧字段会掩盖前端和 schema 的偏差，所以这里直接按 schema 发。
+        // 副作用：OVH 不接受「指定用哪几块盘」，只能给数量，磁盘选择交给 OVH。
+        if (args.hardwareRaid) {
+          Object.entries(args.hardwareRaid).forEach(([gidStr, raidMode]) => {
+            if (!raidMode) return;
+            const parsed = parseInt(gidStr);
+            // 分区全落在默认组、RAID 也没选组时，两边必须并进同一个 storage 条目，
+            // 否则就成了「两个组各配一半」。RAID 自己选了真实组号时按它自己的组走 ——
+            // 以前只看分区侧，分区在默认组 + RAID 选组 2 会被错并进默认组条目
+            const parsedKey = gidKey(parsed);
+            const gid =
+              groups.size === 1 && groups.has(DEFAULT_GID) && parsedKey === DEFAULT_GID
+                ? DEFAULT_GID
+                : parsedKey;
+            if (!groups.has(gid)) {
+              const entry: any = {};
+              if (gid !== DEFAULT_GID) entry.diskGroupId = Number(gid);
+              groups.set(gid, entry);
+            }
+            const g = groups.get(gid);
+            if (!g.hardwareRaid) g.hardwareRaid = [];
+            const level = parseInt(raidMode.replace("raid", ""), 10);
+            if (Number.isNaN(level)) return;
+            const diskCount = args.diskGroups?.[gidStr]?.disks?.length || 0;
+            const item: { raidLevel: number; disks?: number; arrays?: number; spares?: number } = { raidLevel: level };
+            // 0 表示「不知道这组有几块盘」，省略让 OVH 用默认值，别发 disks:0
+            if (diskCount > 0) item.disks = diskCount;
+            // 官方 partitioning-ovh:arrays 用于 RAID10(如 12 盘 4 arrays = 4×RAID1 再 RAID0);
+            // spares 是热备盘数。都只在用户显式填了才发
+            if (args.hwRaidArrays && args.hwRaidArrays > 0 && level === 10) item.arrays = args.hwRaidArrays;
+            if (args.hwRaidSpares && args.hwRaidSpares > 0) item.spares = args.hwRaidSpares;
+            g.hardwareRaid.push(item);
+          });
+        }
+        // 官方 Data erasure:非安装盘组只带 erase:false 即"保留该组数据"。
+        // 默认 OVH 会擦所有盘组 —— 混合盘机器想保住数据盘,这是唯一手段
+        const storageArray = Array.from(groups.values());
+        for (const keepGid of args.keepDiskGroups ?? []) {
+          storageArray.push({ diskGroupId: keepGid, erase: false });
+        }
+        if (storageArray.length > 0) installData.storageConfig = storageArray;
+      } else if (args.partitionSchemeName) {
+        installData.partitionSchemeName = args.partitionSchemeName;
+      }
+
+      const res = await api.post(`/server-control/${args.serviceName}/install`, installData);
+      return res.data as ReinstallResult;
+    },
+  });
+}
+
+export interface InstallStep {
+  /** 已翻译成中文的步骤名 */
+  comment: string;
+  /** OVH 原文，翻译表没覆盖到时可回退显示 */
+  commentOriginal: string;
+  status: string; // todo / doing / done / error
+  error: string;
+}
+
+export interface InstallStatus {
+  elapsedTime: number;
+  progressPercentage: number;
+  totalSteps: number;
+  completedSteps: number;
+  hasError: boolean;
+  /** 有步骤处于 stopping（安装正在中止）—— 既不是错误也不是正常进行中。
+   *  schema 的 InstallationProgressStatusEnum 有 8 个值，以前只认 done/error，
+   *  expired（超时，现已并入 hasError）和 stopping 会让进度条永远卡住不动。 */
+  stopping?: boolean;
+  allDone: boolean;
+  /**
+   * true = OVH 这次没返回 progress（schema 里它可空）。
+   * 此时 progressPercentage 恒为 0、allDone 恒为 false，但那不代表「一步都没做」。
+   * 组件必须显示「进度暂不可用」，否则用户会盯着一个永远停在 0% 的进度条。
+   */
+  progressUnknown: boolean;
+  steps: InstallStep[];
+}
+
+/** 安装进度（前端轮询用，旧前端每 5s 轮一次）（后端返回 { success, hasInstallation, status: {...} }） */
+export function useInstallStatus(serviceName: string | null, enabled = true) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.installStatus(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/install/status`);
+      return {
+        hasInstallation: res.data?.hasInstallation !== false,
+        status: (res.data?.status || null) as InstallStatus | null,
+      };
+    },
+    enabled: !!serviceName && enabled,
+    refetchInterval: enabled ? 5_000 : false,
+    staleTime: 0,
+  });
+}
+
+// ───────────────────────────────── BIOS / Monitoring ─────────────────────────────────
+
+/** BIOS 设置（response.data 即结果对象） */
+export function useServerBiosSettings(serviceName: string | null, enabled = true) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.biosSettings(serviceName || ""), accountId),
+    queryFn: async () => {
+      try {
+        const res = await api.get(`/server-control/${serviceName}/bios-settings`);
+        // SGX 只是个可选子项,单独拿不到不算整体失败,所以只有它继续吞成 null
+        const sgxRes = await api.get(`/server-control/${serviceName}/bios-settings/sgx`).catch(() => null);
+        return {
+          settings: (res.data || {}) as any,
+          sgx: sgxRes?.data?.sgx ?? sgxRes?.data?.data ?? sgxRes?.data ?? null,
+        };
+      } catch (e: any) {
+        // 404 / 501 = 这个机型压根不暴露 BIOS 设置,是业务事实,返回空对象让界面走空态。
+        // 其余错误必须抛出去:以前一律 catch 成 {},isError 永远是 false,对话框只会写
+        // 「未获取到 BIOS 设置」—— 跟"这机器确实没有"长得一模一样,用户根本不会想到去重试。
+        const status = e?.response?.status;
+        if (status === 404 || status === 501) {
+          return { settings: {} as any, sgx: null };
+        }
+        throw e;
+      }
+    },
+    enabled: !!serviceName && enabled,
+  });
+}
+
+/** OVH 监控开关（res.data.monitoring → boolean） */
+export function useServerMonitoring(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.monitoring(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/monitoring`);
+      return !!res.data?.monitoring;
+    },
+    enabled: !!serviceName,
+  });
+}
+
+export function useToggleMonitoring() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ serviceName, enabled }: { serviceName: string; enabled: boolean }) => {
+      const res = await api.put(`/server-control/${serviceName}/monitoring`, { monitoring: enabled });
+      return res.data;
+    },
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.monitoring(vars.serviceName), accountId) });
+    },
+  });
+}
+
+// ───────────────────────────────── Burst / Firewall ─────────────────────────────────
+
+/** Burst：res.data.burst（结构含 status / capacity 等）；某些服务器不支持，会返回 404 */
+export function useServerBurst(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.burst(serviceName || ""), accountId),
+    queryFn: async () => {
+      try {
+        const res = await api.get(`/server-control/${serviceName}/burst`);
+        return { burst: res.data?.burst || null, notAvailable: false } as any;
+      } catch (e: any) {
+        if (e?.response?.status === 404) {
+          return { burst: null, notAvailable: true, error: e?.response?.data?.error } as any;
+        }
+        throw e;
+      }
+    },
+    enabled: !!serviceName,
+    retry: false,
+  });
+}
+
+export function useSetBurst() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ serviceName, status }: { serviceName: string; status: string }) => {
+      const res = await api.put(`/server-control/${serviceName}/burst`, { status });
+      return res.data;
+    },
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.burst(vars.serviceName), accountId) });
+    },
+  });
+}
+
+/** 防火墙：res.data.firewall（结构含 state / mode / model 等）；某些服务器不支持，会返回 404 */
+export function useServerFirewall(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.firewall(serviceName || ""), accountId),
+    queryFn: async () => {
+      try {
+        const res = await api.get(`/server-control/${serviceName}/firewall`);
+        return { firewall: res.data?.firewall || null, notAvailable: false } as any;
+      } catch (e: any) {
+        if (e?.response?.status === 404) {
+          return { firewall: null, notAvailable: true, error: e?.response?.data?.error } as any;
+        }
+        throw e;
+      }
+    },
+    enabled: !!serviceName,
+    retry: false,
+  });
+}
+
+export function useSetFirewall() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ serviceName, enabled }: { serviceName: string; enabled: boolean }) => {
+      const res = await api.put(`/server-control/${serviceName}/firewall`, { enabled });
+      return res.data;
+    },
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.firewall(vars.serviceName), accountId) });
+    },
+  });
+}
+
+// ───────────────────────────────── Backup FTP ─────────────────────────────────
+
+/** ACL 一行。详情没拉到时只有 ipBlock + error */
+export interface BackupFtpAccessEntry {
+  ipBlock: string;
+  ftp?: boolean;
+  nfs?: boolean;
+  cifs?: boolean;
+  isApplied?: boolean;
+  error?: string;
+}
+
+export interface BackupFtpResult {
+  backupFtp?: Record<string, any> | null;
+  accessList?: BackupFtpAccessEntry[];
+  /** ACL 详情拉取失败的条数（后端 failedCount） */
+  accessFailedCount?: number;
+  /** ACL 列表整体拉取失败时的原因（不影响主信息展示） */
+  accessError?: string;
+  /** 该区域/该机器没有备份FTP能力（US 区，或 OVH 说 cannot benefit） */
+  notAvailable?: boolean;
+  /** 功能存在但未激活 —— 只有这一种情况才该显示「激活」按钮 */
+  notActivated?: boolean;
+  /** 服务器不存在或不属于当前账户：显示 error/reason，不要给激活按钮 */
+  unknownService?: boolean;
+  error?: string;
+  /** OVH 原文，用于排查 */
+  reason?: string;
+}
+
+/** Backup FTP：可能 notAvailable / notActivated / unknownService / 正常对象 */
+export function useServerBackupFtp(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.backupFtp(serviceName || ""), accountId),
+    queryFn: async (): Promise<BackupFtpResult> => {
+      try {
+        const res = await api.get(`/server-control/${serviceName}/backup-ftp`);
+        // 后端用 200 + success:false 表达「US 区没这功能」和「服务器不属于本账户」
+        // ——这两种都不是 404「未激活」，必须把原因原样带出去，否则会渲染成一个点了必失败的激活按钮
+        if (res.data?.success === false) {
+          return {
+            // notAvailable 一律置 true：现网组件就是靠它走「不可用 + 显示 error」分支的，
+            // unknownService 只是额外的细分标记（组件可据此换成「服务器不属于当前账户」的文案）
+            notAvailable: true,
+            unknownService: res.data?.unknownService === true,
+            error: res.data?.error,
+            reason: res.data?.reason,
+          };
+        }
+        // 尝试同时取 access 列表
+        let accessList: BackupFtpAccessEntry[] = [];
+        let accessFailedCount = 0;
+        let accessError: string | undefined;
+        try {
+          const accRes = await api.get(`/server-control/${serviceName}/backup-ftp/access`);
+          accessList = (accRes.data?.accessList || []) as BackupFtpAccessEntry[];
+          accessFailedCount = Number(accRes.data?.failedCount) || 0;
+        } catch (e: any) {
+          // 访问列表拿不到不算整体失败，但要说明「列表为空是没查到」而不是「没配过 IP」
+          accessError = apiMessage(e) || e?.message || i18n.t("hooksMsg.server.backupAclLoadFailed");
+        }
+        return { backupFtp: res.data?.backupFtp || null, accessList, accessFailedCount, accessError };
+      } catch (e: any) {
+        if (e?.response?.status === 404) {
+          // US 区的写操作/查询被拦时也是 404，但带 notAvailable，别把它当成「未激活」
+          if (e?.response?.data?.notAvailable === true) {
+            return { notAvailable: true, error: e?.response?.data?.error };
+          }
+          return { notActivated: true };
+        }
+        return { notAvailable: true, error: apiMessage(e) || e?.message };
+      }
+    },
+    enabled: !!serviceName,
+  });
+}
+
+export function useActivateBackupFtp() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (serviceName: string) => {
+      const res = await api.post(`/server-control/${serviceName}/backup-ftp`);
+      return res.data;
+    },
+    onSuccess: (_, serviceName) => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.backupFtp(serviceName), accountId) });
+    },
+  });
+}
+
+/** 关闭备份FTP服务（会删掉里面的备份，调用方必须先二次确认） */
+export function useDeleteBackupFtp() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (serviceName: string) => {
+      const res = await api.delete(`/server-control/${serviceName}/backup-ftp`);
+      return res.data;
+    },
+    onSuccess: (_, serviceName) => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.backupFtp(serviceName), accountId) });
+    },
+  });
+}
+
+/** 重置备份FTP密码（新密码由 OVH 发到账户邮箱，接口不返回明文） */
+export function useResetBackupFtpPassword() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useMutation({
+    mutationFn: async (serviceName: string) => {
+      const res = await api.post(`/server-control/${serviceName}/backup-ftp/password`);
+      return res.data;
+    },
+  });
+}
+
+/** 可授权的 IP 段列表（给「添加访问 IP」做候选） */
+export function useBackupFtpAuthorizableBlocks(serviceName: string | null, enabled = true) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: [...accountQueryKey(qk.serverControl.backupFtpAccess(serviceName || ""), accountId), "authorizable"] as const,
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/backup-ftp/authorizable-blocks`);
+      return (res.data?.blocks || []) as string[];
+    },
+    enabled: !!serviceName && enabled,
+  });
+}
+
+/** 添加备份FTP访问 IP。ftp 默认 true，nfs/cifs 默认 false（与后端一致） */
+export function useAddBackupFtpAccess() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: {
+      serviceName: string;
+      ipBlock: string;
+      ftp?: boolean;
+      nfs?: boolean;
+      cifs?: boolean;
+    }) => {
+      const res = await api.post(`/server-control/${vars.serviceName}/backup-ftp/access`, {
+        ipBlock: vars.ipBlock,
+        ftp: vars.ftp ?? true,
+        nfs: !!vars.nfs,
+        cifs: !!vars.cifs,
+      });
+      return res.data;
+    },
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.backupFtp(vars.serviceName), accountId) });
+    },
+  });
+}
+
+/**
+ * 删除备份FTP访问 IP。
+ * ipBlock 是带掩码的 CIDR（37.59.1.0/28），放在路径里那个 "/" 会被 gin 还原成新的一段导致 404，
+ * 所以走 ?ipBlock= query 形式 —— 后端的路径形式只作兼容兜底。
+ */
+export function useDeleteBackupFtpAccess() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { serviceName: string; ipBlock: string }) => {
+      const res = await api.delete(
+        `/server-control/${vars.serviceName}/backup-ftp/access?ipBlock=${encodeURIComponent(vars.ipBlock)}`
+      );
+      return res.data;
+    },
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.backupFtp(vars.serviceName), accountId) });
+    },
+  });
+}
+
+// ───────────────────────────────── Secondary DNS / vMAC / vRack ─────────────────────────────────
+
+export interface SecondaryDnsDomain extends DetailErrorMarked {
+  domain: string;
+  dns?: string;
+  ipMaster?: string;
+}
+
+export interface VirtualMacEntry extends DetailErrorMarked {
+  macAddress: string;
+  type?: string;
+  ipAddress?: string;
+  virtualNetworkInterface?: string;
+}
+
+export interface VrackEntry extends DetailErrorMarked {
+  vrackName: string;
+  name?: string;
+  description?: string;
+}
+
+export function useServerSecondaryDns(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.secondaryDns(serviceName || ""), accountId),
+    queryFn: async (): Promise<PartialList<SecondaryDnsDomain>> => {
+      const res = await api.get(`/server-control/${serviceName}/secondary-dns`);
+      return readPartialList<SecondaryDnsDomain>(res.data, "domains");
+    },
+    enabled: !!serviceName,
+  });
+}
+
+export function useServerVirtualMac(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.virtualMac(serviceName || ""), accountId),
+    queryFn: async (): Promise<PartialList<VirtualMacEntry>> => {
+      const res = await api.get(`/server-control/${serviceName}/virtual-mac`);
+      return readPartialList<VirtualMacEntry>(res.data, "virtualMacs");
+    },
+    enabled: !!serviceName,
+  });
+}
+
+export function useServerVrack(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.vrack(serviceName || ""), accountId),
+    queryFn: async (): Promise<PartialList<VrackEntry>> => {
+      const res = await api.get(`/server-control/${serviceName}/vrack`);
+      return readPartialList<VrackEntry>(res.data, "vracks");
+    },
+    enabled: !!serviceName,
+  });
+}
+
+// ───────────────────────────────── Orderable / Options / IP Specs / Network Specs ─────────────────────────────────
+
+/** 可订购服务：并发取 bandwidth / traffic / ip 三项 */
+export function useServerOrderable(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.orderable(serviceName || ""), accountId),
+    queryFn: async () => {
+      const [bw, tr, ip] = await Promise.all([
+        api.get(`/server-control/${serviceName}/orderable/bandwidth`).catch(() => ({ data: { success: false } })),
+        api.get(`/server-control/${serviceName}/orderable/traffic`).catch(() => ({ data: { success: false } })),
+        api.get(`/server-control/${serviceName}/orderable/ip`).catch(() => ({ data: { success: false } })),
+      ]);
+      return {
+        bandwidth: bw.data?.success ? bw.data.orderable : null,
+        traffic: tr.data?.success ? tr.data.orderable : null,
+        ip: ip.data?.success ? ip.data.orderable : null,
+      };
+    },
+    enabled: !!serviceName,
+  });
+}
+
+export interface ServerOptionEntry extends DetailErrorMarked {
+  option: string;
+  state?: string;
+  expirationDate?: string;
+}
+
+export function useServerOptions(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.options(serviceName || ""), accountId),
+    queryFn: async (): Promise<PartialList<ServerOptionEntry>> => {
+      const res = await api.get(`/server-control/${serviceName}/options`);
+      return readPartialList<ServerOptionEntry>(res.data, "options");
+    },
+    enabled: !!serviceName,
+  });
+}
+
+export function useServerIpSpecs(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.ipSpecs(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/ip-specs`);
+      return (res.data?.ipSpecs || null) as any;
+    },
+    enabled: !!serviceName,
+  });
+}
+
+export function useServerNetworkSpecs(serviceName: string | null, enabled = true) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.networkSpecs(serviceName || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/server-control/${serviceName}/network-specs`);
+      return (res.data?.network || null) as any;
+    },
+    enabled: !!serviceName && enabled,
+  });
+}
+
+// ───────────────────────────────── Interventions（创建工单） ─────────────────────────────────
+
+/** 故障硬盘。disk_serial 是 OVH schema(dedicated.server.SupportReplaceHddInfo)的必填字段，
+ *  slot_id 可选。字段名保持 snake_case 与官方一致，避免两层转换出错。 */
+export interface FaultyDisk {
+  disk_serial: string;
+  slot_id?: number;
+}
+
+/** 创建硬件更换工单（硬盘 / 内存 / 散热）。
+ *  端点是 POST /server-control/:svc/hardware/replace —— 旧代码发的 POST /interventions
+ *  后端从未注册（只有 GET），所以这个功能此前一直是 404。
+ *
+ *  硬盘两种模式(schema 的 inverse 语义,与 OVH 硬盘更换指南一致):
+ *  - inverse=false:disks 是【要换的】故障盘
+ *  - inverse=true :disks 是【不换的】健康盘 —— 故障盘已经坏到读不出序列号时用,
+ *    指南原话"list the serial numbers of the disks that don't need to be replaced"
+ *  两种模式都不能空列表:空 + inverse=true 等于申请更换整机每一块硬盘。
+ *  返回里带 OVH 的工单号(support.NewMessageInfo.ticketNumber),用户拿它去帮助中心跟进。 */
+export function useCreateIntervention() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (args: {
+      serviceName: string;
+      type: string;
+      details?: string;
+      comment?: string;
+      disks?: FaultyDisk[];
+      inverse?: boolean;
+      slots?: string[];
+    }) => {
+      const res = await api.post<{
+        success: boolean;
+        message: string;
+        ticketNumber?: string;
+        ticketId?: string;
+        notice?: string;
+      }>(`/server-control/${args.serviceName}/hardware/replace`, {
+        componentType: args.type,
+        details: args.details,
+        comment: args.comment,
+        ...(args.disks?.length ? { disks: args.disks, inverse: !!args.inverse } : {}),
+        ...(args.slots?.length ? { slots: args.slots } : {}),
+      });
+      return res.data;
+    },
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.interventions(vars.serviceName), accountId) });
+    },
+  });
+}
+
+// ───────────────────────────────── Contact change ─────────────────────────────────
+
+/** 提交变更联系人请求(POST /change-contact)
+ *  字段名要跟 OVH API 一致: contactAdmin / contactTech / contactBilling */
+export function useChangeContact() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useMutation({
+    mutationFn: async (args: { serviceName: string; admin?: string; tech?: string; billing?: string }) => {
+      const res = await api.post(`/server-control/${args.serviceName}/change-contact`, {
+        contactAdmin: args.admin || undefined,
+        contactTech: args.tech || undefined,
+        contactBilling: args.billing || undefined,
+      });
+      return res.data;
+    },
+  });
+}
+
+export interface ContactChangeRequestList {
+  requests: any[];
+  /**
+   * true = 当前账户所在区域（US）根本没有 /me/task/contactChange 系列端点，后端返 501。
+   * 这是「该区没有这个能力」而不是「请求失败」，组件应隐藏整个模块或显示 message，
+   * 不要渲染成加载失败让用户反复重试。
+   */
+  unsupported: boolean;
+  message?: string;
+  /** 详情拉取失败的条数（后端同时会带 X-Partial-Failures 头） */
+  failedCount: number;
+}
+
+/** 查询所有变更联系人请求（用户全局而非按服务器）。后端返回 { status, data, total, failed } */
+export function useContactChangeRequests(enabled = true) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: qk.serverControl.contactRequests(accountId),
+    queryFn: async (): Promise<ContactChangeRequestList> => {
+      try {
+        const res = await api.get(`/ovh/contact-change-requests`);
+        return {
+          requests: (res.data?.data || res.data?.requests || []) as any[],
+          unsupported: false,
+          failedCount: Number(res.data?.failed) || 0,
+        };
+      } catch (e: any) {
+        // 501 = 该区不支持，不是错误；其余错误照常抛出去让 isError 生效
+        if (e?.response?.status === 501) {
+          return {
+            requests: [],
+            unsupported: true,
+            message: e?.response?.data?.message || i18n.t("hooksMsg.server.contactUnsupported"),
+            failedCount: 0,
+          };
+        }
+        throw e;
+      }
+    },
+    enabled,
+  });
+}
+
+/** 操作单个变更请求（接受 / 拒绝 / 重发邮件） */
+export function useContactRequestAction() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (args: { id: number | string; action: "accept" | "refuse" | "resend"; token?: string }) => {
+      if (args.action === "resend") {
+        const res = await api.post(`/ovh/contact-change-requests/${args.id}/resend-email`);
+        return res.data;
+      }
+      const res = await api.post(`/ovh/contact-change-requests/${args.id}/${args.action}`, {
+        token: args.token,
+      });
+      return res.data;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["server-control", "contact-requests"] });
+    },
+  });
+}
+
+// ───────────────────────────────── Tasks · 可用时间段 ─────────────────────────────────
+
+/** 任务的可用时间段（旧前端 GET /tasks/{id}/available-timeslots?periodStart=&periodEnd=） */
+export function useTaskTimeslots(
+  serviceName: string | null,
+  taskId: number | null,
+  periodStart: string,
+  periodEnd: string,
+  enabled = true
+) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.taskTimeslots(serviceName || "", taskId || 0, periodStart, periodEnd), accountId),
+    queryFn: async () => {
+      const res = await api.get(
+        `/server-control/${serviceName}/tasks/${taskId}/available-timeslots?periodStart=${encodeURIComponent(periodStart)}&periodEnd=${encodeURIComponent(periodEnd)}`
+      );
+      return {
+        timeslots: (res.data?.timeslots || []) as any[],
+        scheduleNotRequired: !!res.data?.scheduleNotRequired,
+      };
+    },
+    enabled: !!serviceName && !!taskId && enabled,
+  });
+}
+
+/**
+ * 给任务改期（干预 / 维护类任务 OVH 要求先选时间段）。
+ * hasPerformedBackup 直接发用户勾选框的真实值：后端不再强制 true，
+ * 未备份也照实转发给 OVH（后端记警告日志），前端替用户勾上等于替他做担保。
+ */
+export function useScheduleTask() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (args: {
+      serviceName: string;
+      taskId: number;
+      /** RFC3339，通常取自 useTaskTimeslots 返回的时间段 */
+      wantedBeginingDate: string;
+      hasPerformedBackup: boolean;
+    }) => {
+      const res = await api.post(`/server-control/${args.serviceName}/tasks/${args.taskId}/schedule`, {
+        wantedBeginingDate: args.wantedBeginingDate,
+        hasPerformedBackup: args.hasPerformedBackup,
+      });
+      return res.data;
+    },
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.tasks(vars.serviceName), accountId) });
+    },
+  });
+}
+
+/** 重启服务器（mutation 封装） */
+export function useRebootServer() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (serviceName: string) => {
+      const res = await api.post(`/server-control/${serviceName}/reboot`);
+      return res.data;
+    },
+    // 重启后启动状态会变成「重启中」→「已生效」
+    onSuccess: (_d, serviceName) => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.bootState(serviceName), accountId) });
+    },
+  });
+}
+
+/** 14 天无理由撤单的资格。eligible=false 时 reason 区分几种完全不同的"不能退" */
+export interface RetractionInfo {
+  accountId?: string;
+  eligible: boolean;
+  /** waived=下单时弃权 / expired=过期 / order_not_found / order_lookup_failed / order_read_failed / bad_date */
+  reason?: string;
+  message?: string;
+  orderId?: number;
+  orderUrl?: string;
+  /** 下单日。撤回期从这天起算，不是从服务器开通日起算 —— 两者常差好几天 */
+  orderDate?: string;
+  retractionDate?: string;
+  hoursLeft?: number;
+  reasons?: { value: string; label: string }[];
+}
+
+/**
+ * 这台机器还能不能无理由撤单。
+ *
+ * 判据是 OVH 返回的 retractionDate,不是前端自己算"开通不到 14 天" ——
+ * v0.1.24 之前下的单在结账时就放弃了撤回权,OVH 不给它们 retractionDate。
+ * 自己算的话那些机器会显示一个点了必然失败的退款按钮。
+ *
+ * 不自动重试:订单映射冷的时候后端会返回 order_lookup_failed 让用户去同步,
+ * 反复重试只会对着同一个冷缓存打空枪。
+ */
+export function useRetraction(serviceName: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery<RetractionInfo>({
+    queryKey: ["server-control", "retraction", serviceName, accountId],
+    queryFn: async () =>
+      (await api.get<RetractionInfo>(`/server-control/${encodeURIComponent(serviceName!)}/retraction`, { params: { account: accountId } })).data,
+    enabled: !!serviceName && !!accountId,
+    staleTime: 5 * 60_000,
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
+}
+
+/** 提交撤单申请。不可逆:订单退款 + 服务器注销 */
+export function useRequestRetraction(serviceName: string, accountId: string) {
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (p: { orderId: number; confirm: true }) =>
+      (
+        await api.post(`/server-control/${encodeURIComponent(serviceName)}/retraction`, {
+          ...p,
+          reason: "other",
+        }, { params: { account: accountId } })
+      ).data,
+    retry: false,
+    onSuccess: (d: any) => {
+      qc.invalidateQueries({ queryKey: ["server-control", "retraction"] });
+      qc.invalidateQueries({ queryKey: ["server-control", "list"] });
+      toast.success(bodyMessage(d) || i18n.t("hooksMsg.server.retractionSubmitted"));
+    },
+    onError: (e: any) => toast.error(apiMessage(e) || i18n.t("hooksMsg.server.retractionFailed")),
+  });
+}
+
+// ───────────────────────────────── 救援模式 ─────────────────────────────────
+
+export interface RescueBoot {
+  bootId: number;
+  bootType?: string;
+  kernel?: string;
+  description?: string;
+}
+export interface RescueStatus {
+  inRescue: boolean;
+  currentBoot: number;
+  rescueMail?: string;
+  boots: RescueBoot[];
+}
+
+/** 这台机现在是不是救援启动 + 有哪些救援项可选 */
+export function useRescueStatus(serviceName: string | null, accountId: string, enabled = true) {
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: [...accountQueryKey(qk.serverControl.rescue(serviceName || ""), accountId), accountId],
+    queryFn: async (): Promise<RescueStatus> => {
+      const d = (await api.get(`/server-control/${encodeURIComponent(serviceName!)}/rescue`, { params: { account: accountId } })).data;
+      return {
+        inRescue: d?.rescueConfigured === true || d?.inRescue === true,
+        currentBoot: Number(d?.currentBoot) || 0,
+        rescueMail: d?.rescueMail || "",
+        boots: Array.isArray(d?.boots) ? d.boots : [],
+      };
+    },
+    enabled: !!serviceName && !!accountId && enabled,
+    staleTime: 0,
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
+}
+
+/** 进救援:改 netboot + 设收信邮箱 + 重启,一次做完 */
+export function useEnterRescue(serviceName: string, accountId: string) {
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (v: { email?: string; useDefaultEmail: boolean; expectedBoot: number; confirm: true }) =>
+      (await api.post(`/server-control/${encodeURIComponent(serviceName)}/rescue`, v, { params: { account: accountId } })).data,
+    retry: false,
+    onSuccess: (d: any) => {
+      // netboot 切换改变 bootModes 的 active 标记
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.bootModes(serviceName), accountId) });
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.bootState(serviceName), accountId) });
+      toast.success(bodyMessage(d) || i18n.t("hooksMsg.server.rescueEntered"));
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.rescue(serviceName), accountId) });
+    },
+    onError: (e: any) => toast.error(apiMessage(e) || i18n.t("hooksMsg.server.rescueEnterFailed")),
+  });
+}
+
+/** 退出救援:切回硬盘启动 + 重启 */
+export function useExitRescue(serviceName: string, accountId: string) {
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (v: { expectedBoot: number; confirm: true }) =>
+      (await api.post(`/server-control/${encodeURIComponent(serviceName)}/rescue/exit`, v, { params: { account: accountId } })).data,
+    retry: false,
+    onSuccess: (d: any) => {
+      // netboot 切换改变 bootModes 的 active 标记
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.bootModes(serviceName), accountId) });
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.bootState(serviceName), accountId) });
+      toast.success(bodyMessage(d) || i18n.t("hooksMsg.server.rescueExited"));
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.serverControl.rescue(serviceName), accountId) });
+    },
+    onError: (e: any) => toast.error(apiMessage(e) || i18n.t("hooksMsg.server.rescueExitFailed")),
+  });
+}
+
+// ───────────────────────────────── SPLA 许可证 ─────────────────────────────────
+
+/** dedicated.server.spla —— schema 字段:id / lastUpdate / serialNumber / status / type */
+export interface SplaLicense {
+  id: number;
+  type: string;   // SplaTypeEnum: os | sqlstd | sqlweb
+  status: string; // SplaStatusEnum: used | waitingToCheck | terminated
+  serialNumber?: string;
+  lastUpdate?: string;
+}
+export interface SplaListResult {
+  list: SplaLicense[];
+  /** 详情部分拉失败:这时不能断言"没有 os 授权",可能只是没查到 */
+  partial: boolean;
+}
+
+export function useSplaList(serviceName: string | null, enabled = true) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.serverControl.spla(serviceName || ""), accountId),
+    queryFn: async (): Promise<SplaListResult> => {
+      const d = (await api.get(`/server-control/${serviceName}/spla`)).data;
+      return {
+        list: Array.isArray(d?.splaList) ? d.splaList : [],
+        partial: d?.partial === true,
+      };
+    },
+    enabled: !!serviceName && enabled,
+    staleTime: 60_000,
+  });
+}
+
+/**
+ * 某一类 SPLA 授权是不是已经登记且有效。
+ *
+ * SplaStatusEnum 只有 used / waitingToCheck / terminated 三个值。
+ * waitingToCheck 也算数 —— OVH 还在核,但记录已经建上了,重复提交没有意义。
+ */
+export function hasActiveSpla(r: SplaListResult | undefined, type: string): boolean {
+  if (!r) return false;
+  return r.list.some(
+    (x) => x.type === type && String(x.status || "").toLowerCase() !== "terminated"
+  );
+}

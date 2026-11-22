@@ -1,0 +1,1161 @@
+import { Switch } from "@/components/ui/switch";
+import { useConfirm } from "@/components/common/ConfirmDialog";
+import { OrderDurationField, OrderDurationLabel } from "@/components/queue/OrderDurationField";
+import { AutoPayOption } from "@/components/common/AutoPayStatus";
+import { useOrderDurations } from "@/hooks/use-order-durations";
+import { supportsDuration } from "@/lib/order-duration";
+import { createFileRoute, Link } from "@tanstack/react-router";
+import { useTranslation, Trans } from "react-i18next";
+import {
+  Bell,
+  BellOff,
+  RefreshCw,
+  Trash2,
+  X,
+  History as HistoryIcon,
+  ChevronUp,
+  Plus,
+  AlertTriangle,
+  Pencil,
+  HelpCircle, Pause, Play } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { PageHeader } from "@/components/common/PageHeader";
+import { ListToolbar, SearchBox, Segmented } from "@/components/common/ListToolbar";
+import { HeatGrid } from "@/components/pearl/HeatGrid";
+import { Swimlane, type SwimLane } from "@/components/pearl/Swimlane";
+import { useStockEvents } from "@/hooks/use-stock-history";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Chip } from "@/components/common/Chip";
+import { useActiveAccount } from "@/hooks/use-active-account";
+import { findAccountByID, useAccounts } from "@/hooks/use-accounts";
+import { AccountChip } from "@/components/common/AccountChip";
+import { StatusDot } from "@/components/common/StatusDot";
+import { EmptyState } from "@/components/common/EmptyState";
+import { Skeleton } from "@/components/common/Skeleton";
+import { LoadFailed, errorMessage } from "@/components/common/LoadFailed";
+import { fmtDateTime } from "@/i18n/format";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle } from "@/components/ui/dialog";
+import {
+  useMonitorList,
+  useMonitorStatus,
+  useToggleMonitor,
+  useRemoveMonitorSubscription,
+  useClearMonitor,
+  useCreateMonitorSubscription,
+  useUpdateMonitorSubscription,
+  useMonitorHistory,
+  type MonitorSubscription,
+  useSetMonitorInterval, usePauseMonitorSubscription } from "@/hooks/use-monitor";
+import { useNotifyGate } from "@/hooks/use-notify-channels";
+import { toast } from "sonner";
+import { useServers } from "@/hooks/use-servers";
+import { describeOptionCodes, groupOptions, type OptionGroupKey } from "@/lib/option-groups";
+import { OptionGroupSection } from "@/components/common/OptionGroupSection";
+import { splitList } from "@/lib/split-list";
+
+/** 服务器监控订阅 */
+export const Route = createFileRoute("/monitor")({
+  component: MonitorPage,
+});
+
+
+/** 订阅身份 = planCode + 配置组合(同型号不同内存是两条独立订阅) */
+function subKey(s: { planCode: string; options?: string[] }) {
+  return `${s.planCode}|${[...(s.options || [])].sort().join(",")}`;
+}
+
+function MonitorPage() {
+  const { t } = useTranslation();
+  const list = useMonitorList();
+  const events = useStockEvents(list.data, "server");
+  const status = useMonitorStatus();
+  const toggleMonitor = useToggleMonitor();
+  const [confirmAsk, confirmDialog] = useConfirm();
+  const remove = useRemoveMonitorSubscription();
+  const pause = usePauseMonitorSubscription();
+  const clear = useClearMonitor();
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  const [openAdd, setOpenAdd] = useState(false);
+  // 正在编辑的订阅。null = 新增模式,两种模式共用同一个对话框
+  const [editing, setEditing] = useState<MonitorSubscription | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  const subs = list.data || [];
+
+  // 监控状态是三态:还在读 / 读失败 / 真数据。后两者绝不能混。
+  // status 接口挂了 ≠ 监控停了 —— 后端的监控协程照跑、订阅照检查,只是这一次 HTTP 没问到。
+  // 以前这里直接 `status.data?.running` 取到 undefined,界面就白纸黑字写「已停止」,
+  // 订阅数 / 间隔 / 已知服务器还一律 ?? 0。用户据此去重加订阅、重启监控,
+  // 反而把本来在跑的东西弄乱。所以未知就必须说未知,数字一律显示 —。
+  const running = !!status.data?.running;
+  const statusUnknown = status.isPending || status.isError;
+  /** 状态里的数字:0 是有含义的真值（真的一条订阅都没有），不能拿它冒充"没读到" */
+  const statNum = (v: number | undefined): number | string =>
+    status.isPending ? "…" : status.isError || v === undefined ? "—" : v;
+
+  const [filter, setFilter] = useState<"all" | "active" | "paused">("all");
+  const [search, setSearch] = useState("");
+  const pausedCount = subs.filter((s) => s.paused).length;
+  const visibleSubs = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return subs.filter((s) => {
+      if (filter === "active" && s.paused) return false;
+      if (filter === "paused" && !s.paused) return false;
+      if (!q) return true;
+      return [s.planCode, s.serverName || "", ...s.datacenters].some((v) => v.toLowerCase().includes(q));
+    });
+  }, [subs, filter, search]);
+
+  return (
+    <div className="space-y-3 sm:space-y-5">
+      <PageHeader
+        icon={Bell}
+        title={t("monitor.title")}
+        description={t("monitor.description")}
+        action={
+          <div className="flex flex-wrap justify-end gap-2">
+            <Button variant="outline" size="sm" onClick={() => list.refetch()} disabled={list.isFetching}>
+              <RefreshCw className={`w-4 h-4 ${list.isFetching ? "animate-spin" : ""}`} />
+              {t("common.refresh")}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setConfirmClear(true)}
+              disabled={subs.length === 0}
+            >
+              <Trash2 className="w-4 h-4" />
+              {t("monitor.clearAll")}
+            </Button>
+            <Button size="sm" onClick={() => setOpenAdd(true)}>
+              <Plus className="w-4 h-4" />
+              {t("monitor.addAction")}
+            </Button>
+          </div>
+        }
+      />
+
+      {/* 状态条:状态 + 订阅数 / 间隔(可就地修改) / 已知服务器 */}
+      <Card>
+        <CardContent className="px-4 py-3 flex flex-wrap items-center gap-x-8 gap-y-3">
+          <div className="flex items-center gap-3 min-w-0 mr-auto">
+            <div className="w-9 h-9 rounded-lg bg-secondary flex items-center justify-center shrink-0">
+              {statusUnknown ? (
+                <HelpCircle
+                  className={`w-4 h-4 ${status.isError ? "text-warning" : "text-muted-foreground"}`}
+                />
+              ) : running ? (
+                <Bell className="w-4 h-4 text-success" />
+              ) : (
+                <BellOff className="w-4 h-4 text-muted-foreground" />
+              )}
+            </div>
+            <div className="min-w-0">
+              <div className="text-[13px] font-medium">{t("monitor.status.title")}</div>
+              <div className="text-xs text-muted-foreground inline-flex items-center gap-1.5">
+                <StatusDot
+                  tone={status.isError ? "warning" : running ? "success" : "muted"}
+                  pulse={running && !statusUnknown}
+                  size="xs"
+                />
+                {status.isPending
+                  ? t("monitor.status.loading")
+                  : status.isError
+                    ? t("monitor.status.unknown")
+                    : running
+                      ? t("monitor.status.running")
+                      : t("monitor.status.stopped")}
+              </div>
+              {status.isError && (
+                <button
+                  type="button"
+                  className="block text-left text-[11px] text-destructive underline underline-offset-2 mt-0.5 max-w-xs"
+                  onClick={() => status.refetch()}
+                  title={t("monitor.status.retryTitle")}
+                >
+                  {t("monitor.status.readFailedRetry", { err: errorMessage(status.error) })}
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-8 gap-y-2 text-sm">
+            {/* 全局开关:以前网页上没有,监控被 Telegram 停掉后只能回 Telegram 才能启动 */}
+            {!status.isPending && !status.isError && (
+              <Switch
+                checked={running}
+                disabled={toggleMonitor.isPending}
+                aria-label={t("monitor.status.switchAria")}
+                className="data-[state=checked]:bg-success data-[state=unchecked]:bg-input"
+                onCheckedChange={async (on) => {
+                  if (!on) {
+                    const ok = await confirmAsk({
+                      title: t("monitor.status.stopTitle"),
+                      description: t("monitor.status.stopDesc"),
+                      tone: "danger",
+                      confirmText: t("monitor.status.stopConfirm"),
+                    });
+                    if (!ok) return;
+                  }
+                  toggleMonitor.mutate(on);
+                }}
+              />
+            )}
+            <Stat label={t("monitor.status.subsCount")} value={statNum(status.data?.subscriptions_count)} />
+            <IntervalStat
+              current={status.isError ? undefined : status.data?.check_interval}
+              unknownLabel={status.isPending ? "…" : "—"}
+            />
+            <Stat
+              label={t("monitor.status.knownServers")}
+              value={statNum(status.data?.known_servers_count)}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* 区域问题:后端发现监控查错大区(如 US 账户的订阅在 EU 目录找不到)时逐条列出。
+          不渲染的话监控静默失效,用户只看到"一直没货" */}
+      {(status.data?.region_issues?.length ?? 0) > 0 && (
+        <div className="border border-warning/40 bg-warning/5 rounded-xl p-3 space-y-1.5">
+          {(status.data?.region_issues ?? []).map((issue, i) => (
+            <p key={i} className="text-[12px] text-foreground/80 leading-relaxed break-words">
+              ⚠️ {issue.planCode}{issue.region ? ` @ ${issue.region}` : ""}
+              {issue.subsidiary ? ` (${issue.subsidiary})` : ""}: {issue.error}
+            </p>
+          ))}
+        </div>
+      )}
+
+      {/* 订阅列表 */}
+      {list.isPending ? (
+        <Card className="p-4 space-y-3">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Skeleton key={i} className="h-14 rounded-lg" />
+          ))}
+        </Card>
+      ) : list.isError ? (
+        /* 列表没读到 ≠ 一条订阅都没有。以前这里直接掉进"暂无订阅",
+           而订阅其实还在后端跑着 —— 用户看见空列表会照着再加一遍,
+           同一个型号被订两次,补货时就通知两次、自动下单两次。 */
+        <Card>
+          <LoadFailed
+            icon={Bell}
+            title={t("monitor.list.failed")}
+            error={list.error}
+            onRetry={() => list.refetch()}
+          />
+        </Card>
+      ) : subs.length === 0 ? (
+        <Card>
+          <EmptyState
+            illustration="monitor"
+            title={t("monitor.list.empty")}
+            description={t("monitor.list.emptyDesc")}
+            action={<Button onClick={() => setOpenAdd(true)}>{t("monitor.list.emptyAdd")}</Button>}
+          />
+        </Card>
+      ) : (
+        <Card className="overflow-hidden cq">
+          <ListToolbar
+            end={<SearchBox value={search} onChange={setSearch} placeholder={t("monitor.list.search")} className="w-full sm:w-60" />}
+          >
+            <Segmented<"all" | "active" | "paused">
+              label={t("monitor.list.title")}
+              value={filter}
+              onChange={setFilter}
+              options={[
+                { value: "all", label: t("monitor.list.filterAll"), count: subs.length },
+                { value: "active", label: t("monitor.list.filterActive"), count: subs.length - pausedCount },
+                { value: "paused", label: t("monitor.list.filterPaused"), count: pausedCount },
+              ]}
+            />
+          </ListToolbar>
+          {visibleSubs.length === 0 ? (
+            <p className="px-4 py-10 text-center text-sm text-muted-foreground">{t("monitor.list.noMatch")}</p>
+          ) : (
+            <div className="divide-y divide-border">
+              {visibleSubs.map((s) => (
+                <SubRow
+                  key={subKey(s)}
+                  sub={s}
+                  paused={!!s.paused}
+                  expanded={expanded === subKey(s)}
+                  onTogglePause={() =>
+                    pause.mutate({
+                      planCode: s.planCode,
+                      optionsKey: [...(s.options || [])].sort().join(","),
+                      paused: !s.paused,
+                    })
+                  }
+                  onToggleExpand={() =>
+                    setExpanded((curr) => (curr === subKey(s) ? null : subKey(s)))
+                  }
+                  onEdit={() => {
+                    setEditing(s);
+                    setOpenAdd(true);
+                  }}
+                  onDelete={() => setConfirmRemove(subKey(s))}
+                />
+              ))}
+            </div>
+          )}
+        </Card>
+      )}
+
+      {/* 库存变化:热力格(时段分布) + 当天机房时间线 */}
+      {list.data && (list.data || []).length > 0 && (
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-3 sm:gap-5">
+          <section className="app-card panel min-w-0 xl:col-span-7">
+            <div className="panel-head"><span className="eyebrow">{t("monitor.heatTitle")}</span></div>
+            <div className="panel-body"><HeatGrid cells={(events.data || []).map((e) => ({ ts: e.ts }))} loading={events.isPending} /></div>
+          </section>
+          <section className="app-card panel min-w-0 xl:col-span-5">
+            <div className="panel-head"><span className="eyebrow">{t("monitor.swimTitle")}</span></div>
+            <div className="panel-body">
+              <Swimlane lanes={
+                (() => {
+                  const today = new Date(); today.setHours(0,0,0,0);
+                  const byDc = new Map<string, import("@/components/pearl/Swimlane").SwimBlock[]>();
+                  for (const e of events.data || []) {
+                    const ts = new Date(e.ts).getTime();
+                    if (ts < today.getTime()) continue;
+                    const arr = byDc.get(e.datacenter) || [];
+                    arr.push({ at: e.ts, failed: e.changeType === "unavailable", label: `${e.planCode} ${e.status}` });
+                    byDc.set(e.datacenter, arr);
+                  }
+                  return Array.from(byDc, ([name, blocks]) => ({ name, blocks })).slice(0, 8);
+                })()
+              } />
+            </div>
+          </section>
+        </div>
+      )}
+
+      {confirmDialog}
+      {/* 添加订阅 Dialog */}
+      <AddSubscriptionDialog
+        open={openAdd}
+        editing={editing}
+        onOpenChange={(v) => {
+          setOpenAdd(v);
+          // 关掉就退出编辑模式,否则下次点"添加订阅"会带出上一条的内容
+          if (!v) setEditing(null);
+        }}
+      />
+
+      {/* 删除确认 */}
+      <Dialog open={!!confirmRemove} onOpenChange={(v) => !v && setConfirmRemove(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("monitor.remove.title")}</DialogTitle>
+            <DialogDescription>
+              <Trans
+                i18nKey="monitor.remove.desc"
+                values={{ code: confirmRemove || "" }}
+                components={{ code: <span className="font-mono" /> }}
+                t={t}
+              />
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmRemove(null)}>
+              {t("common.cancel")}
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                                if (confirmRemove) {
+                  const sub = subs.find((x) => subKey(x) === confirmRemove);
+                  remove.mutate({ planCode: sub?.planCode || confirmRemove, optionsKey: sub ? [...(sub.options || [])].sort().join(",") : undefined });
+                }
+                setConfirmRemove(null);
+              }}
+            >
+              {t("monitor.remove.confirm")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 清空确认 */}
+      <Dialog open={confirmClear} onOpenChange={setConfirmClear}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("monitor.clear.title")}</DialogTitle>
+            <DialogDescription>{t("monitor.clear.desc")}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmClear(false)}>
+              {t("common.cancel")}
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                clear.mutate();
+                setConfirmClear(false);
+              }}
+            >
+              {t("monitor.clear.confirm")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+/* ------------------------------ 行 / 历史 ------------------------------ */
+
+function SubRow({
+  sub,
+  expanded,
+  paused,
+  onTogglePause,
+  onToggleExpand,
+  onEdit,
+  onDelete,
+}: {
+  sub: MonitorSubscription;
+  expanded: boolean;
+  paused: boolean;
+  onTogglePause: () => void;
+  onToggleExpand: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="px-4 py-3">
+      <div className={`list-row ${paused ? "opacity-60" : ""}`}>
+        <div className="lr-main">
+          <div className="flex items-center gap-2 min-w-0">
+            <StatusDot tone={paused ? "warning" : "success"} size="xs" />
+            <span className="font-mono font-semibold text-[13px] truncate">{sub.planCode}</span>
+          </div>
+          {sub.serverName && (
+            <div className="text-xs text-muted-foreground truncate mt-0.5 pl-3.5" title={sub.serverName}>{sub.serverName}</div>
+          )}
+          <div className="text-xs text-muted-foreground mt-0.5 pl-3.5 break-words">
+            {sub.datacenters.length > 0
+              ? t("monitor.row.dcs", { dcs: sub.datacenters.join(", ") })
+              : t("monitor.row.allDcs")}
+          </div>
+        </div>
+        <div className="lr-meta flex gap-1.5 flex-wrap items-center">
+          {/* 盯全部配置 vs 只盯一套,是「会不会一次触发好几单」的分水岭,
+              必须在列表上一眼看得出来 */}
+          {sub.options && sub.options.length > 0 ? (
+            <Chip tone="default" title={sub.options.join("\n")}>
+              {t("monitor.row.watchOnly", { options: describeOptionCodes(sub.options) })}
+            </Chip>
+          ) : (
+            <Chip tone="default" title={t("monitor.row.watchAllTitle")}>
+              {t("monitor.row.watchAll")}
+            </Chip>
+          )}
+          {sub.paused && <Chip tone="warning">{t("monitor.row.paused")}</Chip>}
+          {sub.notifyAvailable && <Chip tone="success">{t("monitor.row.notifyAvailable")}</Chip>}
+          {sub.notifyUnavailable && <Chip tone="warning">{t("monitor.row.notifyUnavailable")}</Chip>}
+          <Chip><OrderDurationLabel value={sub.duration} /></Chip>
+        </div>
+        <div className="lr-side space-y-1">
+          <div className="flex gap-1.5 flex-wrap items-center">
+            {sub.autoOrder && sub.autoOrderAccountId ? (
+              <>
+                <Chip
+                  tone="solid"
+                  title={sub.autoPay ? t("monitor.row.autoPayTitle") : t("monitor.row.manualPayTitle")}
+                >
+                  {t("monitor.row.autoOrder")}
+                  {sub.quantity && sub.quantity > 1 ? ` ×${sub.quantity}` : ""}
+                  {sub.autoPay ? t("monitor.row.autoPaySuffix") : ""}
+                </Chip>
+                <span className="text-[11px] text-muted-foreground">→</span>
+                <AccountChip accountId={sub.autoOrderAccountId} />
+              </>
+            ) : sub.autoOrder ? (
+              <Chip tone="warning">{t("monitor.row.autoNoAccount")}</Chip>
+            ) : null}
+          </div>
+          <p className="text-[11px] text-muted-foreground" title={t("monitor.row.restockHint")}>
+            {sub.lastRestockAt ? t("monitor.row.lastRestock", { time: fmtDateTime(sub.lastRestockAt) }) : t("monitor.row.noRestock")}
+          </p>
+        </div>
+        <div className="lr-act flex items-center gap-0.5">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8"
+            aria-label={paused ? t("monitor.row.resumeAria") : t("monitor.row.pauseAria")}
+            title={paused ? t("monitor.row.resumeAria") : t("monitor.row.pauseAria")}
+            onClick={onTogglePause}
+          >
+            {paused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8"
+            aria-label={t("monitor.row.historyAria")}
+            title={t("monitor.row.historyAria")}
+            aria-expanded={expanded}
+            onClick={onToggleExpand}
+          >
+            {expanded ? <ChevronUp className="w-4 h-4" /> : <HistoryIcon className="w-4 h-4" />}
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8"
+            onClick={onEdit}
+            aria-label={t("monitor.row.editAria")}
+            title={t("monitor.row.editTitle")}
+          >
+            <Pencil className="w-4 h-4" />
+          </Button>
+          <Button variant="ghost" size="icon" className="h-8 w-8 hover:text-destructive" onClick={onDelete} aria-label={t("common.delete")} title={t("common.delete")}>
+            <X className="w-4 h-4" />
+          </Button>
+        </div>
+      </div>
+
+      {expanded && (
+        <div className="mt-3 pt-3 border-t border-border">
+          <HistoryPanel planCode={sub.planCode} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HistoryPanel({ planCode }: { planCode: string }) {
+  const { t } = useTranslation();
+  const history = useMonitorHistory(planCode);
+
+  if (history.isPending) {
+    return (
+      <div className="space-y-2">
+        {Array.from({ length: 3 }).map((_, i) => (
+          <Skeleton key={i} className="h-10 rounded-xl" />
+        ))}
+      </div>
+    );
+  }
+
+  // "暂无历史记录"是一句结论:这台机器从订阅到现在一次都没变过货,
+  // 用户会据此判断"这型号根本不补货,别等了"。读失败时说这句话就是在给假消息。
+  if (history.isError) {
+    return (
+      <LoadFailed
+        icon={HistoryIcon}
+        title={t("monitor.history.failed")}
+        error={history.error}
+        onRetry={() => history.refetch()}
+        compact
+      />
+    );
+  }
+
+  const entries = history.data || [];
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-3">
+        <HistoryIcon className="w-4 h-4 text-muted-foreground" />
+        <span className="text-sm font-medium">{t("monitor.history.title")}</span>
+      </div>
+      {entries.length === 0 ? (
+        <p className="text-xs text-muted-foreground text-center py-4">{t("monitor.history.empty")}</p>
+      ) : (
+        <div className="space-y-2 max-h-64 overflow-y-auto">
+          {entries.map((e, i) => (
+            <div
+              key={i}
+              className="flex items-start gap-3 p-2.5 bg-muted/40 rounded-xl text-xs"
+            >
+              <StatusDot
+                tone={e.changeType === "available" ? "success" : e.changeType === "price_check_failed" ? "info" : "danger"}
+                size="sm"
+                className="mt-1"
+              />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-medium">{e.datacenter?.toUpperCase()}</span>
+                  <Chip tone={e.changeType === "available" ? "success" : e.changeType === "price_check_failed" ? "info" : "danger"}>
+                    {e.changeType === "available"
+                      ? t("monitor.history.available")
+                      : e.changeType === "price_check_failed"
+                        ? t("monitor.history.priceCheckFailed")
+                        : t("monitor.history.unavailable")}
+                  </Chip>
+                  {e.config?.display && (
+                    <span className="px-2 py-0.5 rounded-full bg-secondary text-[11px]">
+                      {e.config.display}
+                    </span>
+                  )}
+                </div>
+                <p className="text-muted-foreground mt-1">{fmtDateTime(e.timestamp)}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ----------------------------- 添加订阅 Dialog ----------------------------- */
+
+/**
+ * 新增 / 编辑订阅共用一个对话框。
+ *
+ * 编辑模式下型号是只读的：型号就是订阅的身份，改它等于换一台机器，
+ * 那该走"删掉旧的、加个新的"，而不是把一条带着历史记录的订阅偷偷指向别处。
+ */
+function AddSubscriptionDialog({
+  open,
+  onOpenChange,
+  editing,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  editing?: MonitorSubscription | null;
+}) {
+  const { t } = useTranslation();
+  const create = useCreateMonitorSubscription();
+  const update = useUpdateMonitorSubscription();
+  const isEdit = !!editing;
+  // 门禁看的是「所有通道」,不是只看 Telegram —— 只配 webhook 的用户也该能订阅
+  const [notifyBlocked, notifyReason, notifyChecking] = useNotifyGate();
+  const [planCode, setPlanCode] = useState("");
+  const [datacenters, setDatacenters] = useState("");
+  const [notifyAvailable, setNotifyAvailable] = useState(true);
+  const [notifyUnavailable, setNotifyUnavailable] = useState(false);
+  const [autoOrder, setAutoOrder] = useState(false);
+  const [quantity, setQuantity] = useState(1);
+  // 默认不自动付款:自动扣钱必须显式打开
+  const [autoPay, setAutoPay] = useState(false);
+  const [duration, setDuration] = useState("P1M");
+  // 只盯哪一套配置。空 = 盯全部配置(老行为)。
+  // 后端引擎一直支持,以前前端没接 —— 于是网页建的订阅永远是「盯全部」,
+  // 而通知和自动下单是按配置逐套触发的:三套配置同时补货就是三份通知、三单。
+  const [picked, setPicked] = useState<Partial<Record<OptionGroupKey, string>>>({});
+  // 型号不在目录里(手输的冷门机型 / 目录没拉到)时退回手填,跟下单弹窗同一套策略
+  const [extraOptions, setExtraOptions] = useState("");
+  const serversQ = useServers();
+  const matchedServer = useMemo(
+    () => (serversQ.data || []).find((sv) => sv.planCode === planCode.trim()),
+    [serversQ.data, planCode]
+  );
+  const grouped = useMemo(
+    () => (matchedServer ? groupOptions(matchedServer.availableOptions) : null),
+    [matchedServer]
+  );
+  const defaultValueSet = useMemo(
+    () => new Set((matchedServer?.defaultOptions || []).map((o) => o.value)),
+    [matchedServer]
+  );
+  /** 提交给后端的 addon 列表:目录里有这个型号就走 chip,没有就走手填,二选一不混用 */
+  const chosenOptions = useMemo(() => {
+    if (matchedServer) return [...new Set([...(Object.values(picked).filter(Boolean) as string[]), ...splitList(extraOptions)])];
+    return splitList(extraOptions);
+  }, [matchedServer, picked, extraOptions]);
+  // 订阅的下单账户 = 左侧菜单栏的全局账户,不再单独选
+  const [globalAccountId] = useActiveAccount();
+  const accountsQ = useAccounts();
+  const allAccounts = accountsQ.data;
+  const autoOrderAccountId =
+    editing?.autoOrderAccountId || globalAccountId || allAccounts?.find((a) => a.isDefault)?.id || allAccounts?.[0]?.id || "";
+  const activeAcc = findAccountByID(allAccounts, autoOrderAccountId);
+  const durationOptions = useOrderDurations(autoOrderAccountId, planCode.trim(), "eco", open);
+  const durationSupported = supportsDuration(durationOptions.data, duration);
+  // 账户列表读失败 ≠ 一个账户都没配。两种情况以前都显示「未选择账户」,
+  // 然后自动下单被静默拦掉 —— 用户看到的是一条没有理由的死路:
+  // 去账户页明明有账户,回来还是"未选择"。失败必须说出失败,并给重试。
+  const accountsFailed = accountsQ.isError && !activeAcc;
+
+  const reset = () => {
+    setPlanCode("");
+    setDatacenters("");
+    setNotifyAvailable(true);
+    setNotifyUnavailable(false);
+    setAutoOrder(false);
+    setQuantity(1);
+    setAutoPay(false);
+    setDuration("P1M");
+    setPicked({});
+    setExtraOptions("");
+  };
+
+  // 每次打开都按当前 editing 重灌一次表单。依赖里带上 open,
+  // 否则用户改了几个字段又取消,下次打开看到的还是上次改了一半的样子。
+  //
+  // 依赖里**绝不能**放 matchedServer:它随用户打字而变(打到目录里真实存在的
+  // 型号那一刻从 undefined 变成对象)。新增模式下 effect 一重跑就走 else 分支
+  // reset(),把用户刚打进去的型号清空 —— 清空后又匹配不上,再触发一轮,
+  // 来回抖动直接撞 React 的 Maximum update depth exceeded。
+  // 这正是 v0.1.22 那个"输入 24sk202 就闪退"。
+  useEffect(() => {
+    if (!open) return;
+    if (editing) {
+      setPlanCode(editing.planCode);
+      setPicked({});
+      setExtraOptions((editing.options || []).join(", "));
+      setDatacenters((editing.datacenters || []).join(", "));
+      setNotifyAvailable(editing.notifyAvailable);
+      setNotifyUnavailable(editing.notifyUnavailable);
+      setAutoOrder(!!editing.autoOrder);
+      setQuantity(editing.quantity && editing.quantity > 0 ? editing.quantity : 1);
+      setAutoPay(!!editing.autoPay);
+      setDuration(editing.duration || "P1M");
+      // 配置的回填交给下面那个 effect —— 它要等目录到位才能把 addon code
+      // 映射成 chip,而目录是异步来的,不能塞进这个"打开即重灌"的 effect 里
+    } else {
+      reset();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, editing]);
+
+  // 编辑模式下回填已选配置。单独一个 effect,因为它要等 matchedServer(目录)到位,
+  // 而目录是异步来的。它只写 picked / extraOptions,绝不碰 planCode —— 上面那个
+  // effect 才负责表单重灌,两者职责不能混,混了就是上面注释里说的那个死循环。
+  //
+  // filledFor 保证每次打开只回填一次:用户开始手动改配置之后,目录刷新
+  // (useServers 有 refetch)不该把他的选择重置回订阅里存的那份。
+  const filledFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!open || !editing) {
+      filledFor.current = null;
+      return;
+    }
+    if (filledFor.current === editing.planCode) return;
+
+    const want = editing.options || [];
+    if (want.length === 0) {
+      // 订阅本来就是"盯全部配置",没什么可回填的。标记成已处理,
+      // 免得目录到位后再进来一次
+      filledFor.current = editing.planCode;
+      setPicked({});
+      setExtraOptions("");
+      return;
+    }
+    // 目录还没到:先什么都别做,等它来了这个 effect 会因为 matchedServer 变化再跑一次。
+    // 这时候如果贸然把 want 全塞进手填框,目录一到位又要清掉重来,用户会看到闪一下。
+    if (!matchedServer) return;
+
+    filledFor.current = editing.planCode;
+    const g = groupOptions(matchedServer.availableOptions);
+    const next: Partial<Record<OptionGroupKey, string>> = {};
+    const used = new Set<string>();
+    for (const key of Object.keys(g) as OptionGroupKey[]) {
+      const hit = (g[key] || []).find((o) => want.includes(o.value));
+      if (hit) {
+        next[key] = hit.value;
+        used.add(hit.value);
+      }
+    }
+    setPicked(next);
+    // chip 没覆盖到的 addon 走手填框,不能丢 —— 丢了保存时就把它从订阅里抹掉了
+    setExtraOptions(want.filter((v) => !used.has(v)).join(", "));
+  }, [open, editing, matchedServer]);
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const code = planCode.trim();
+    if (!code) {
+      toast.error(t("monitor.toast.needPlanCode"));
+      return;
+    }
+    const dcs = splitList(datacenters);
+
+    if (autoOrder && !autoOrderAccountId) {
+      // 读失败和"真的没账户"要给不同的话:前者该重试,后者该去加账户
+      toast.error(
+        accountsFailed
+          ? t("monitor.toast.accountFailed", { err: errorMessage(accountsQ.error) })
+          : t("monitor.toast.needAccount")
+      );
+      return;
+    }
+    if (!durationSupported) { toast.error(t("orderDuration.unsupported")); return; }
+    const payload = {
+      planCode: code,
+      datacenters: dcs,
+      notifyAvailable,
+      notifyUnavailable,
+      autoOrder,
+      quantity: autoOrder ? quantity : undefined,
+      autoOrderAccountId: autoOrder ? autoOrderAccountId : "",
+      autoPay: autoOrder ? autoPay : false,
+      duration,
+      // 始终显式传:PUT 用 *[]string 区分「没传」和「改成空数组」,
+      // 不传的话后端保留旧值,用户在界面上清空了配置却不生效
+      options: chosenOptions,
+    };
+    const done = {
+      onSuccess: () => {
+        reset();
+        onOpenChange(false);
+      },
+    };
+    if (isEdit) update.mutate({ ...payload, optionsKey: [...(editing.options || [])].sort().join(",") }, done);
+    else create.mutate(payload, done);
+  };
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(v) => {
+        if (!v) reset();
+        onOpenChange(v);
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{isEdit ? t("monitor.dialog.editTitle") : t("monitor.dialog.addTitle")}</DialogTitle>
+          <DialogDescription>
+            {isEdit ? t("monitor.dialog.editDesc") : t("monitor.dialog.addDesc")}
+          </DialogDescription>
+        </DialogHeader>
+
+        <form onSubmit={submit} className="space-y-4">
+          {notifyBlocked && (
+            <div className="flex items-start gap-2.5 rounded-lg border border-warning/40 bg-warning/10 px-3.5 py-2.5">
+              <AlertTriangle className="w-4 h-4 text-warning mt-0.5 flex-shrink-0" />
+              <div className="text-xs flex-1 min-w-0">
+                <div className="font-medium text-foreground">
+                  {t("monitor.notify.noChannel")}
+                </div>
+                <div className="text-muted-foreground mt-0.5 break-words">
+                  {notifyReason || t("monitor.notify.hint")}
+                </div>
+                <Link
+                  to="/settings"
+                  className="inline-block mt-1 text-foreground underline underline-offset-2"
+                >
+                  {t("monitor.notify.goConfig")}
+                </Link>
+              </div>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-xs font-medium text-muted-foreground mb-1.5">
+              {t("monitor.dialog.planCode")} <span className="text-destructive">*</span>
+            </label>
+            <Input
+              value={planCode}
+              onChange={(e) => setPlanCode(e.target.value)}
+              placeholder={t("monitor.dialog.planCodePlaceholder")}
+              autoFocus={!isEdit}
+              readOnly={isEdit}
+              className={isEdit ? "bg-muted text-muted-foreground cursor-not-allowed" : undefined}
+            />
+            {isEdit && (
+              <p className="text-[11px] text-muted-foreground mt-1">
+                {t("monitor.dialog.planCodeReadOnly")}
+              </p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-muted-foreground mb-1.5">
+              {t("monitor.dialog.dcLabel")}
+            </label>
+            <Input
+              value={datacenters}
+              onChange={(e) => setDatacenters(e.target.value)}
+              placeholder={t("monitor.dialog.dcPlaceholder")}
+            />
+          </div>
+
+          {/* 盯哪一套配置。
+              一个型号底下常有好几套内存/存储组合，而通知和自动下单是**按配置逐套**
+              触发的 —— 不限定的话「自动抢 1 台」= 每套配置在每个机房各抢 1 台。
+              留空保持老行为（盯全部），所以这一块默认是收起的提示而不是必填项。 */}
+          <div>
+            <label className="block text-xs font-medium text-muted-foreground mb-1.5">
+              {t("monitor.dialog.optionsLabel")}
+            </label>
+            {serversQ.isPending ? (
+              <Skeleton className="h-16 rounded-xl" />
+            ) : grouped ? (
+              <div className="space-y-3 rounded-xl border border-border p-3.5">
+                {(["cpu", "memory", "systemStorage", "storage", "bandwidth", "vrack", "other"] as OptionGroupKey[])
+                  .filter((g) => (grouped[g] || []).length > 0)
+                  .map((g) => (
+                    <OptionGroupSection
+                      key={g}
+                      groupKey={g}
+                      options={grouped[g]}
+                      picked={picked[g] || ""}
+                      defaultValueSet={defaultValueSet}
+                      onPick={(v) =>
+                        setPicked((prev) => ({ ...prev, [g]: prev[g] === v ? "" : v }))
+                      }
+                    />
+                  ))}
+                {chosenOptions.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => { setPicked({}); setExtraOptions(""); }}
+                    className="text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                  >
+                    {t("monitor.dialog.clearOptions")}
+                  </button>
+                )}
+              </div>
+            ) : (
+              // 目录里没有这个型号（冷门机型 / 目录没拉到）→ 退回手填，跟下单弹窗同一策略
+              <Input
+                value={extraOptions}
+                onChange={(e) => setExtraOptions(e.target.value)}
+                placeholder={t("monitor.dialog.optionsPlaceholder")}
+              />
+            )}
+            {matchedServer && (isEdit || extraOptions) && <Input aria-label={t("queue.extraOptionsPlaceholder")} placeholder={t("queue.extraOptionsPlaceholder")}
+              value={extraOptions} onChange={(e) => setExtraOptions(e.target.value)} />}
+            <p className="text-[11px] text-muted-foreground mt-1">
+              {chosenOptions.length > 0
+                ? t("monitor.dialog.optionsSelected", { n: chosenOptions.length })
+                : t("monitor.dialog.optionsEmptyHint")}
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <label className="flex items-center gap-2.5 cursor-pointer rounded-xl border border-border px-3.5 py-2.5 hover:bg-muted/40 transition-colors">
+              <Checkbox
+                checked={notifyAvailable}
+                onCheckedChange={(v) => setNotifyAvailable(!!v)}
+              />
+              <span className="text-sm">{t("monitor.dialog.notifyAvailable")}</span>
+            </label>
+            <label className="flex items-center gap-2.5 cursor-pointer rounded-xl border border-border px-3.5 py-2.5 hover:bg-muted/40 transition-colors">
+              <Checkbox
+                checked={notifyUnavailable}
+                onCheckedChange={(v) => setNotifyUnavailable(!!v)}
+              />
+              <span className="text-sm">{t("monitor.dialog.notifyUnavailable")}</span>
+            </label>
+            <label className="flex items-center gap-2.5 cursor-pointer rounded-xl border border-border px-3.5 py-2.5 hover:bg-muted/40 transition-colors sm:col-span-2">
+              <Checkbox checked={autoOrder} onCheckedChange={(v) => setAutoOrder(!!v)} />
+              <span className="text-sm">{t("monitor.dialog.autoOrder")}</span>
+            </label>
+          </div>
+
+          {!autoOrder && <OrderDurationField value={duration} onChange={setDuration} query={durationOptions} />}
+
+          {autoOrder && (
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-muted-foreground mb-1.5">
+                  {t("monitor.dialog.accountLabel")}
+                </label>
+                {/* 订阅的下单账户就绑当前账户 —— 页面上再放一个选择器,
+                    就会出现"用 A 账户看库存、订阅却绑到 B 账户"的错配,
+                    而三区库存互不相通,触发时才发现下不了单 */}
+                {accountsFailed ? (
+                  <div className="flex items-start gap-2 px-3 py-2 rounded-xl border border-destructive/40 bg-destructive/5">
+                    <AlertTriangle className="w-3.5 h-3.5 text-destructive flex-shrink-0 mt-0.5" />
+                    <span className="text-[12px] min-w-0 break-words">
+                      {t("monitor.dialog.accountFailed", { err: errorMessage(accountsQ.error) })}
+                    </span>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="ml-auto flex-shrink-0"
+                      onClick={() => accountsQ.refetch()}
+                    >
+                      {t("common.retry")}
+                    </Button>
+                  </div>
+                ) : (
+                  <AccountChip accountId={autoOrderAccountId} />
+                )}
+                <p className="text-[11px] text-muted-foreground mt-1">
+                  {t("monitor.dialog.accountHint")}
+                </p>
+                {/* 提交会被拦掉的两种理由写在这里,别让用户点了才知道 */}
+                {accountsFailed ? (
+                  <p className="text-[11px] text-destructive mt-1">
+                    {t("monitor.dialog.accountFailedHint")}
+                  </p>
+                ) : !accountsQ.isPending && !autoOrderAccountId ? (
+                  <p className="text-[11px] text-destructive mt-1">
+                    {t("monitor.dialog.noAccountHint")}
+                  </p>
+                ) : null}
+              </div>
+              <OrderDurationField value={duration} onChange={setDuration} query={durationOptions} />
+              <div>
+                <label className="block text-xs font-medium text-muted-foreground mb-1.5">
+                  {t("monitor.dialog.qtyLabel")}
+                </label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={quantity}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v)) {
+                      setQuantity(Math.max(1, Math.min(20, Math.floor(v))));
+                    }
+                  }}
+                  placeholder={t("monitor.dialog.qtyPlaceholder")}
+                />
+                <p className="text-[11px] text-muted-foreground mt-1.5">
+                  {t("monitor.dialog.qtyHint")}
+                </p>
+                <AutoPayOption
+                  className="mt-2.5"
+                  checked={autoPay}
+                  onChange={setAutoPay}
+                  accountIds={[autoOrderAccountId]}
+                  title={t("monitor.dialog.autoPay")}
+                  description={t("monitor.dialog.autoPayHint")}
+                />
+            </div>
+            </div>
+          )}
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                reset();
+                onOpenChange(false);
+              }}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button
+              type="submit"
+              disabled={create.isPending || update.isPending || (!isEdit && (notifyBlocked || notifyChecking))}
+              title={
+                notifyBlocked
+                  ? notifyReason || t("monitor.dialog.blockedTitle")
+                  : undefined
+              }
+            >
+              {create.isPending || update.isPending
+                ? t("monitor.dialog.submitting")
+                : notifyChecking && !isEdit
+                  ? t("monitor.dialog.checking")
+                  : isEdit
+                    ? t("monitor.dialog.save")
+                    : t("monitor.dialog.confirmAdd")}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: number | string }) {
+  return (
+    <div>
+      <div className="text-[11px] text-muted-foreground">{label}</div>
+      <div className="text-base font-semibold tabular-nums">{value}</div>
+    </div>
+  );
+}
+
+/**
+ * 检查间隔：点一下就地改。后端合法区间 1-3600 秒，越界会被夹紧并回传真实生效值。
+ *
+ * current 可能是 undefined —— 状态接口挂了的时候。这时候显示 0s 是在编数字
+ * （0 秒是个根本不存在的间隔），点进去编辑框还会预填 0,一保存就把一个
+ * 正在跑的监控改成用户压根没打算要的值。所以未知就显示 — 且不给改。
+ */
+function IntervalStat({
+  current,
+  unknownLabel = "—",
+}: {
+  current?: number;
+  unknownLabel?: string;
+}) {
+  const { t } = useTranslation();
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(current === undefined ? "" : String(current));
+  const mut = useSetMonitorInterval();
+
+  useEffect(() => {
+    if (!editing) setValue(current === undefined ? "" : String(current));
+  }, [current, editing]);
+
+  const submit = async () => {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) {
+      toast.error(t("monitor.interval.needPositive"));
+      return;
+    }
+    await mut.mutateAsync(Math.round(n));
+    setEditing(false);
+  };
+
+  if (current === undefined) {
+    return (
+      <div>
+        <div className="text-muted-foreground text-xs">{t("monitor.interval.label")}</div>
+        <div
+          className="font-semibold tabular-nums text-muted-foreground"
+          title={t("monitor.interval.unknownTitle")}
+        >
+          {unknownLabel}
+        </div>
+      </div>
+    );
+  }
+
+  if (!editing) {
+    return (
+      <div>
+        <div className="text-muted-foreground text-xs">{t("monitor.interval.label")}</div>
+        <button
+          className="font-semibold tabular-nums hover:underline"
+          onClick={() => setEditing(true)}
+          title={t("monitor.interval.editTitle")}
+        >
+          {current}s
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div>
+      <div className="text-muted-foreground text-xs">{t("monitor.interval.editLabel")}</div>
+      <div className="flex items-center gap-1">
+        <input
+          autoFocus
+          type="number"
+          min={1}
+          max={3600}
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void submit();
+            if (e.key === "Escape") setEditing(false);
+          }}
+          className="w-20 px-2 py-0.5 border border-border rounded text-sm bg-background"
+        />
+        <Button size="sm" variant="ghost" onClick={() => void submit()} disabled={mut.isPending}>
+          {mut.isPending ? "…" : t("common.save")}
+        </Button>
+      </div>
+    </div>
+  );
+}

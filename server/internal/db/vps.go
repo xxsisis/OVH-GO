@@ -1,0 +1,216 @@
+package db
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/ovh-buy/server/internal/types"
+)
+
+type vpsSubRow struct {
+	Duration           string `db:"duration"`
+	ID                 string `db:"id"`
+	PlanCode           string `db:"plan_code"`
+	OvhSubsidiary      string `db:"ovh_subsidiary"`
+	DatacentersJSON    string `db:"datacenters"`
+	MonitorLinux       int    `db:"monitor_linux"`
+	MonitorWindows     int    `db:"monitor_windows"`
+	NotifyAvailable    int    `db:"notify_available"`
+	NotifyUnavailable  int    `db:"notify_unavailable"`
+	LastStatusJSON     string `db:"last_status"`
+	HistoryJSON        string `db:"history"`
+	CreatedAt          string `db:"created_at"`
+	AutoOrderAccountID string `db:"auto_order_account_id"`
+	AutoOrder          int    `db:"auto_order"`
+	Quantity           int    `db:"quantity"`
+	AutoPay            int    `db:"auto_pay"`
+	OS                 string `db:"os"`
+}
+
+func rowToVPSSub(r vpsSubRow) (types.VPSSubscription, error) {
+	var dcs []string
+	if err := json.Unmarshal([]byte(r.DatacentersJSON), &dcs); err != nil {
+		return types.VPSSubscription{}, fmt.Errorf("vps %s datacenters: %w", r.ID, err)
+	}
+	if dcs == nil {
+		dcs = []string{}
+	}
+	last := map[string]string{}
+	if err := json.Unmarshal([]byte(r.LastStatusJSON), &last); err != nil {
+		return types.VPSSubscription{}, fmt.Errorf("vps %s status: %w", r.ID, err)
+	}
+	var hist []map[string]interface{}
+	if err := json.Unmarshal([]byte(r.HistoryJSON), &hist); err != nil {
+		return types.VPSSubscription{}, fmt.Errorf("vps %s history: %w", r.ID, err)
+	}
+	if hist == nil {
+		hist = []map[string]interface{}{}
+	}
+	return types.VPSSubscription{
+		ID:                 r.ID,
+		Duration:           r.Duration,
+		PlanCode:           r.PlanCode,
+		OvhSubsidiary:      r.OvhSubsidiary,
+		Datacenters:        dcs,
+		MonitorLinux:       r.MonitorLinux == 1,
+		MonitorWindows:     r.MonitorWindows == 1,
+		NotifyAvailable:    r.NotifyAvailable == 1,
+		NotifyUnavailable:  r.NotifyUnavailable == 1,
+		LastStatus:         last,
+		History:            hist,
+		CreatedAt:          r.CreatedAt,
+		AutoOrderAccountID: r.AutoOrderAccountID,
+		AutoOrder:          r.AutoOrder == 1,
+		Quantity:           r.Quantity,
+		AutoPay:            r.AutoPay == 1,
+		OS:                 r.OS,
+	}, nil
+}
+
+func vpsSubToRow(s types.VPSSubscription) (vpsSubRow, error) {
+	if s.Datacenters == nil {
+		s.Datacenters = []string{}
+	}
+	if s.LastStatus == nil {
+		s.LastStatus = map[string]string{}
+	}
+	if s.History == nil {
+		s.History = []map[string]interface{}{}
+	}
+	dcsJSON, _ := json.Marshal(s.Datacenters)
+	lastJSON, _ := json.Marshal(s.LastStatus)
+	histJSON, err := json.Marshal(s.History)
+	if err != nil {
+		return vpsSubRow{}, err
+	}
+	bi := func(b bool) int {
+		if b {
+			return 1
+		}
+		return 0
+	}
+	return vpsSubRow{
+		ID:                 s.ID,
+		Duration:           s.Duration,
+		PlanCode:           s.PlanCode,
+		OvhSubsidiary:      s.OvhSubsidiary,
+		DatacentersJSON:    string(dcsJSON),
+		MonitorLinux:       bi(s.MonitorLinux),
+		MonitorWindows:     bi(s.MonitorWindows),
+		NotifyAvailable:    bi(s.NotifyAvailable),
+		NotifyUnavailable:  bi(s.NotifyUnavailable),
+		LastStatusJSON:     string(lastJSON),
+		HistoryJSON:        string(histJSON),
+		CreatedAt:          s.CreatedAt,
+		AutoOrderAccountID: s.AutoOrderAccountID,
+		AutoOrder:          bi(s.AutoOrder),
+		Quantity:           s.Quantity,
+		AutoPay:            bi(s.AutoPay),
+		OS:                 s.OS,
+	}, nil
+}
+
+// ListVPSSubscriptions 取全部 VPS 订阅
+func (db *DB) ListVPSSubscriptions() ([]types.VPSSubscription, error) {
+	var rows []vpsSubRow
+	if err := db.Select(&rows, `SELECT * FROM vps_subscriptions ORDER BY created_at`); err != nil {
+		return nil, fmt.Errorf("list vps subs: %w", err)
+	}
+	out := make([]types.VPSSubscription, 0, len(rows))
+	for _, r := range rows {
+		item, err := rowToVPSSub(r)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+// UpsertVPSSubscription 按 id upsert
+// auto_order_account_id 必须出现在 INSERT 列表里:ON CONFLICT 分支引用的 excluded.xxx
+// 取的是"这次 INSERT 尝试插入的值",列不在 INSERT 列表里时它等于列默认值(空串),
+// 于是每次更新都会把订阅的自动下单账户清空。
+func (db *DB) UpsertVPSSubscription(s types.VPSSubscription) error {
+	r, err := vpsSubToRow(s)
+	if err != nil {
+		return err
+	}
+	_, err = db.NamedExec(`
+		INSERT INTO vps_subscriptions
+		(id, duration, plan_code, ovh_subsidiary, datacenters, monitor_linux, monitor_windows,
+		 notify_available, notify_unavailable, last_status, history, created_at, auto_order_account_id,
+		 auto_order, quantity, auto_pay, os)
+		VALUES
+		(:id, :duration, :plan_code, :ovh_subsidiary, :datacenters, :monitor_linux, :monitor_windows,
+		 :notify_available, :notify_unavailable, :last_status, :history, :created_at, :auto_order_account_id,
+		 :auto_order, :quantity, :auto_pay, :os)
+		ON CONFLICT(id) DO UPDATE SET
+		  duration           = excluded.duration,
+		  plan_code          = excluded.plan_code,
+		  ovh_subsidiary     = excluded.ovh_subsidiary,
+		  datacenters        = excluded.datacenters,
+		  monitor_linux      = excluded.monitor_linux,
+		  monitor_windows    = excluded.monitor_windows,
+		  notify_available   = excluded.notify_available,
+		  notify_unavailable = excluded.notify_unavailable,
+		  last_status            = excluded.last_status,
+		  history                = excluded.history,
+		  auto_order_account_id  = excluded.auto_order_account_id,
+		  auto_order             = excluded.auto_order,
+		  quantity               = excluded.quantity,
+		  auto_pay               = excluded.auto_pay,
+		  os                     = excluded.os
+	`, r)
+	if err != nil {
+		return fmt.Errorf("upsert vps sub %s: %w", s.ID, err)
+	}
+	return nil
+}
+
+// ReplaceVPSSubscriptions 全表覆盖
+func (db *DB) ReplaceVPSSubscriptions(subs []types.VPSSubscription) error {
+	tx, err := db.Beginx()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM vps_subscriptions`); err != nil {
+		return err
+	}
+	for _, s := range subs {
+		r, err := vpsSubToRow(s)
+		if err != nil {
+			return err
+		}
+		_, err = tx.NamedExec(`
+			INSERT INTO vps_subscriptions
+			(id, duration, plan_code, ovh_subsidiary, datacenters, monitor_linux, monitor_windows,
+			 notify_available, notify_unavailable, last_status, history, created_at, auto_order_account_id,
+			 auto_order, quantity, auto_pay, os)
+			VALUES
+			(:id, :duration, :plan_code, :ovh_subsidiary, :datacenters, :monitor_linux, :monitor_windows,
+			 :notify_available, :notify_unavailable, :last_status, :history, :created_at, :auto_order_account_id,
+			 :auto_order, :quantity, :auto_pay, :os)
+		`, r)
+		if err != nil {
+			return fmt.Errorf("insert vps sub %s: %w", s.ID, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// DeleteVPSSubscription 按 id 删
+func (db *DB) DeleteVPSSubscription(id string) error {
+	_, err := db.Exec(`DELETE FROM vps_subscriptions WHERE id = ?`, id)
+	return err
+}
+
+// ClearVPSSubscriptions 清空
+func (db *DB) ClearVPSSubscriptions() (int64, error) {
+	res, err := db.Exec(`DELETE FROM vps_subscriptions`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}

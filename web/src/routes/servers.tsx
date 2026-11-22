@@ -1,0 +1,1350 @@
+import { OrderPurchaseScope, type PurchaseMode } from "@/components/queue/OrderPurchaseScope";
+import { AutoPayOption } from "@/components/common/AutoPayStatus";
+import { hasPreorderHardware } from "@/lib/preorder-options";
+import { OrderDurationField, OrderDurationLabel } from "@/components/queue/OrderDurationField";
+import { preorderVariantCoversAll, preorderOptions, retainPreorderPlan } from "@/lib/preorder-options";
+import { useOrderDurations } from "@/hooks/use-order-durations";
+import { supportsDuration } from "@/lib/order-duration";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { OrderPrewarm } from "@/components/queue/OrderPrewarm";
+import { useOrderPrewarm } from "@/hooks/use-order-prewarm";
+import { useTranslation, Trans } from "react-i18next";
+import { isOrderable } from "@/lib/availability";
+import {
+  Server, RefreshCw, Search, Bell, ShoppingCart, Cpu, MemoryStick, HardDrive, Wifi,
+  Filter, MapPin, Globe, ArrowUpDown, ArrowUpNarrowWide, ArrowDownWideNarrow, ArrowDown, ChevronDown, Pencil, Save } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { PageHeader } from "@/components/common/PageHeader";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Chip } from "@/components/common/Chip";
+import { StatusDot } from "@/components/common/StatusDot";
+import { Skeleton } from "@/components/common/Skeleton";
+import { EmptyState } from "@/components/common/EmptyState";
+import { LoadFailed, LoadFailedBanner } from "@/components/common/LoadFailed";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
+import { useServers, useAddToMonitor, type ServerPlan, useCatalogAccountId } from "@/hooks/use-servers";
+import { useAccountInfo } from "@/hooks/use-account";
+import { useCreateQueueItem, useUpdateQueueItem, type QueueItem } from "@/hooks/use-queue";
+import { AccountChip } from "@/components/common/AccountChip";
+import { useCacheInfo } from "@/hooks/use-settings";
+import { useDefaultAccount } from "@/hooks/use-accounts";
+import { useActiveAccount } from "@/hooks/use-active-account";
+import { toast } from "sonner";
+import { Loader2 } from "lucide-react";
+import {
+  useAvailability,
+  buildAvailabilityMap,
+  buildVariantIndex,
+  variantsForPlan,
+  variantDcStatus,
+  hasStockWithOption,
+  useOvhCatalog,
+  buildCatalogIndex,
+  computePriceFromOptions,
+  formatPrice,
+  type AvailabilityItem,
+  type CatalogIndex,
+  type PriceInfo,
+} from "@/hooks/use-availability";
+import { groupOptions, type OptionGroupKey } from "@/lib/option-groups";
+import { OptionGroupSection } from "@/components/common/OptionGroupSection";
+import { lookupDcStatus, datacentersForPlan, apiDatacenterCode } from "@/lib/datacenters";
+import { OVH_SUBSIDIARIES } from "@/lib/ovh-subsidiaries";
+import { formatMoney, currencyUnknownHint, comparePrices } from "@/lib/money";
+import { useAccounts, findAccountByID } from "@/hooks/use-accounts";
+import { OrderAccountPicker, PreorderTriggerPicker, rememberAccounts, rememberedAccounts, type PreorderTrigger } from "@/components/queue/OrderAccountPicker";
+import { endpointRegion, regionLabel } from "@/lib/ovh-regions";
+import { clampOrderPlan, MAX_ORDER_QUANTITY, MAX_ORDER_FANOUT } from "@/lib/order-limits";
+import { mergeStockPlans, matchesServerSearch } from "@/lib/stock-plans";
+
+/** 服务器列表：卡片网格 + 详情弹窗 */
+export const Route = createFileRoute("/servers")({
+  component: ServersPage,
+});
+
+
+
+/**
+ * 没有价格时显示什么。
+ *
+ * 以前一律显示"价格加载中" —— 但目录早就加载完了,只是这个 planCode 不在当前子公司的
+ * 目录里(三区目录互不相通,机型代码都不一样)。用户盯着一个永远转不完的"加载中",
+ * 完全不知道发生了什么。现在把两种情况分开说。
+ */
+function PriceFallback({ loading, subsidiary, prerelease }: { loading: boolean; subsidiary: string; prerelease?: boolean }) {
+  const { t } = useTranslation();
+  if (prerelease) return <span className="text-muted-foreground font-normal">{t("queue.preorderPricePending")}</span>;
+  if (loading) {
+    return <span className="text-muted-foreground font-normal">{t("servers.price.loading")}</span>;
+  }
+  return (
+    <span
+      className="text-muted-foreground font-normal"
+      title={t("servers.price.noQuoteTitle", { subsidiary })}
+    >
+      {t("servers.price.noQuote", { subsidiary })}
+    </span>
+  );
+}
+
+function ServersPage() {
+  const { t } = useTranslation();
+  const q = useServers();
+  // 单次拉取 OVH 公开可用性接口（一条请求拿到所有 planCode × 所有 DC 的状态）
+  const availQ = useAvailability();
+  const availMap = useMemo(() => buildAvailabilityMap(availQ.data), [availQ.data]);
+  // FQN 级索引,抢购对话框按当前选配实时算 DC 可用 + option 绿红点
+  const variantIndex = useMemo(() => buildVariantIndex(availQ.data), [availQ.data]);
+
+  // OVH 账户信息：拿 ovhSubsidiary 作为默认价格地区
+  const account = useAccountInfo();
+  const accountSub = account.data?.info.ovhSubsidiary;
+
+  // 计价子公司必须跟**机型列表是按哪个子公司拉的**保持一致。
+  // 后端 /api/servers 用的是账户配置里的 zone(catalog.SubsidiaryOfAccount),
+  // 所以这里也用 zone —— 不能用 OVH /me 返回的 ovhSubsidiary:
+  // 两者不一致时(账户 zone 填错,后端会回 X-Subsidiary-Mismatch 警告),
+  // 列表里是 A 子公司的 planCode、价格却去查 B 子公司的目录,
+  // 查不到就一直显示"价格加载中",而用户根本看不出是配置错了。
+  const pageAccounts = useAccounts();
+  const [activeAccountId] = useActiveAccount();
+  const defaultPageAccount = useDefaultAccount();
+  const activeAcc = findAccountByID(pageAccounts.data, activeAccountId) || defaultPageAccount;
+  const subsidiary = (activeAcc?.zone || accountSub || "IE").toUpperCase();
+
+  // 单次拉取所选 subsidiary 的目录算价格（base plan + addon family 月费累加）
+  const catalogQ = useOvhCatalog(subsidiary);
+  const catalogIdx = useMemo(() => buildCatalogIndex(catalogQ.data), [catalogQ.data]);
+  // 卡片显示价格用每台服务器的 catalog defaultOptions 算,跟详情对话框打开时的初始价格一致。
+  // 旧的 buildPriceMap 走 FQN 维度前缀匹配,跟 catalog 默认值可能挑到不同 addon → 卡片价跟弹窗价对不上。
+  const priceMap = useMemo(() => {
+    const out: Record<string, PriceInfo> = {};
+    for (const srv of q.data || []) {
+      const defaults = (srv.defaultOptions || []).map((o) => o.value).filter(Boolean);
+      const p = computePriceFromOptions(srv.planCode, defaults, catalogIdx);
+      if (p) out[srv.planCode] = p;
+    }
+    return out;
+  }, [q.data, catalogIdx]);
+
+  const [search, setSearch] = useState("");
+  const [onlyAvailable, setOnlyAvailable] = useState(false);
+  const [series, setSeries] = useState("");
+  // 价格排序:default=目录原序;asc/desc 按 priceMap 的含税月费(无价格的排最后,不消失)
+  const [priceSort, setPriceSort] = useState<"default" | "asc" | "desc">("default");
+  const [detailPlanCode, setDetailPlanCode] = useState<string | null>(null);
+
+  const list = useMemo(() => mergeStockPlans(q.data || [], availQ.data), [q.data, availQ.data]);
+  const filtered = useMemo(() => {
+    const s = search.trim().toLowerCase();
+    let out = list;
+    if (s) {
+      out = out.filter((srv) => matchesServerSearch(srv, s));
+    }
+    if (series) out = out.filter((srv) => seriesOf(srv.name) === series);
+    if (onlyAvailable) {
+      out = out.filter((srv) => {
+        const map = availMap[srv.planCode];
+        if (map) {
+          // 实时数据：任一 DC 可用即视为可用
+          return Object.values(map).some((v) => isOrderable(v));
+        }
+        // 实时还没到：用目录里的静态字段兜底
+        return srv.datacenters.some((dc) => isOrderable(dc.availability));
+      });
+    }
+    return out;
+  }, [list, search, onlyAvailable, availMap, series]);
+
+  // 系列快捷筛选(KS / SYS / RISE / ADVANCE …):从商品名前缀归类,按数量多少排序
+  const seriesList = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const srv of list) {
+      const k = seriesOf(srv.name);
+      if (k) m.set(k, (m.get(k) || 0) + 1);
+    }
+    return [...m.entries()].sort((a, b) => b[1] - a[1]);
+  }, [list]);
+
+  // 价格排序独立于筛选:目录价格是异步到的,priceMap 更新后顺序自动跟上
+  const sorted = useMemo(() => {
+    if (priceSort === "default") return filtered;
+    return [...filtered].sort((a, b) => comparePrices(priceMap[a.planCode]?.total, priceMap[b.planCode]?.total, priceSort));
+  }, [filtered, priceSort, priceMap]);
+
+  const detailServer = detailPlanCode ? list.find((s) => s.planCode === detailPlanCode) || null : null;
+
+  return (
+    <div className="space-y-3 sm:space-y-6">
+      <PageHeader
+        icon={Server}
+        title={t("servers.title")}
+        description={t("servers.description")}
+        action={
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <CacheBadge />
+            <Button
+              variant="outline"
+              onClick={() => {
+                // 一键刷三件套：目录强刷（清后端缓存）、catalog（价格）refetch、可用性 refetch
+                q.forceRefresh();
+                catalogQ.refetch();
+                availQ.refetch();
+              }}
+              // 只看手动刷新状态：q.isRefreshing 是 forceRefresh 期间的 mutation pending；
+              // *Q.isRefetching 是 refetch 后的状态。不引入 isFetching/isLoading，
+              // 这样首次加载的菊花不会显示在这个按钮上，避免误导。
+              disabled={q.isRefreshing || catalogQ.isRefetching || availQ.isRefetching}
+            >
+              <RefreshCw
+                className={`w-4 h-4 ${
+                  q.isRefreshing || catalogQ.isRefetching || availQ.isRefetching
+                    ? "animate-spin"
+                    : ""
+                }`}
+              />
+              {t("servers.refresh")}
+            </Button>
+          </div>
+        }
+      />
+
+      {/* 工具条。手机端:搜索框独占一行(要能看清输入),下面一行放「仅显示可用」+
+          结算币种 + 计数 —— 以前这四样各占一整行,在 390px 宽里白吃 ~240px。 */}
+        <div className="search-form m-surface flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
+          <div className="relative w-full sm:flex-1 min-w-0">
+            <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground pointer-events-none" />
+            <Input
+              placeholder={t("servers.searchPlaceholder")}
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="pl-9 rounded-full"
+            />
+          </div>
+          {/* 手机端把下面三样裹进一行 flex,sm+ 时 contents 让它们回到父级排布 */}
+          <div className="flex items-center gap-2 flex-wrap sm:contents">
+          <Button
+            variant={onlyAvailable ? "default" : "outline"}
+            size="sm"
+            className="rounded-full flex-shrink-0"
+            onClick={() => setOnlyAvailable((v) => !v)}
+          >
+            <Filter className="w-3.5 h-3.5" />
+            {t("servers.onlyAvailable")}
+          </Button>
+          {/* 价格排序:三态轮换(默认→升→降),asc/desc 高亮为蓝 */}
+          <Button
+            variant={priceSort === "default" ? "outline" : "default"}
+            size="sm"
+            className="rounded-full flex-shrink-0"
+            onClick={() => setPriceSort((v) => (v === "default" ? "asc" : v === "asc" ? "desc" : "default"))}
+            title={t("servers.sortPriceTitle")}
+          >
+            {priceSort === "asc" ? <ArrowUpNarrowWide className="w-3.5 h-3.5" /> : priceSort === "desc" ? <ArrowDownWideNarrow className="w-3.5 h-3.5" /> : <ArrowUpDown className="w-3.5 h-3.5" />}
+            {priceSort === "default" ? t("servers.sortPrice") : priceSort === "asc" ? t("servers.sortPriceAsc") : t("servers.sortPriceDesc")}
+          </Button>
+          {/* 价格地区不再单独选:它以前只换价格、不换机型列表,而下拉里写着「US · 美国」,
+              看上去像是切到了美区目录 —— 实际列表还是欧区的 planCode(24sk602 vs 美区的
+              24sk602-v1-us),照着它下单必然被拒。现在币种直接跟当前账户的子公司走。 */}
+          <span className="inline-flex items-center gap-1.5 h-8 sm:h-9 px-2.5 sm:px-3 rounded-full border border-border text-[11px] sm:text-[12px] text-muted-foreground flex-shrink-0">
+            <Globe className="w-3.5 h-3.5" />
+            <Trans
+              i18nKey="servers.priceRegion"
+              values={{ subsidiary }}
+              components={{ b: <b className="text-foreground font-semibold" /> }}
+              t={t}
+            />
+          </span>
+          <span className="text-[11px] sm:text-[12px] text-muted-foreground whitespace-nowrap">
+            {q.isPending ? t("servers.loadingShort") : t("servers.totalCount", { n: sorted.length })}
+          </span>
+          </div>
+        </div>
+
+      {/* 系列快捷筛选:两百多款机型里一点就缩到某个系列,可与搜索、仅显示可用叠加 */}
+      {seriesList.length > 1 && (
+        <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label={t("servers.seriesLabel")}>
+          {[["", list.length] as [string, number], ...seriesList].map(([k, n]) => (
+            <button
+              key={k || "all"}
+              type="button"
+              aria-pressed={series === k}
+              onClick={() => setSeries(k)}
+              className={`inline-flex items-center gap-1.5 h-8 px-3 rounded-full text-[12.5px] transition-colors ${
+                series === k ? "bg-primary text-primary-foreground font-medium shadow-sm" : "bg-card text-muted-foreground ring-1 ring-border hover:text-foreground hover:ring-primary/40"
+              }`}
+            >
+              {k || t("servers.seriesAll")}
+              <span className="tabular-nums opacity-70 text-[11.5px]">{n}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* 后端 /me 响应上的 X-Subsidiary-Mismatch:账户里配的 zone 跟 OVH 认的 ovhSubsidiary 不一致。
+          这一页的机型集合、价格、库存全部由子公司决定,配错了看到的整页都是别的区的东西,
+          而且要到下单那一刻才会失败,所以在这里就得说清楚。 */}
+      {account.data?.subsidiaryMismatch && (
+        <div className="flex items-start gap-2 rounded-xl border border-warning/40 bg-warning/5 px-3 py-2 text-[12px]">
+          <MapPin className="w-4 h-4 text-warning flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="font-semibold">{t("servers.mismatch.title")}</p>
+            <p className="text-muted-foreground mt-0.5">
+              <Trans
+                i18nKey="servers.mismatch.desc"
+                values={{
+                  actual: accountSub || "—",
+                  expected: accountSub || t("servers.mismatch.expectedFallback"),
+                }}
+                components={{ code: <code className="font-mono" /> }}
+                t={t}
+              />
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* 库存接口挂了 —— 必须说出来。卡片上的红点这时候来自目录里的静态字段,
+          不是实时库存,把它当成"缺货"会让用户直接放弃一台其实有货的机器。 */}
+      {availQ.isError && (
+        <LoadFailedBanner
+          title={t("servers.availFailedTitle")}
+          error={availQ.error}
+          onRetry={() => availQ.refetch()}
+        />
+      )}
+      {q.isError && list.length > 0 && (
+        <LoadFailedBanner title={t("servers.listFailedTitle")} error={q.error} onRetry={() => q.refetch()} />
+      )}
+
+      {/* 网格 */}
+      {q.isPending && list.length === 0 ? (
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <Skeleton key={i} className="h-[260px] rounded-2xl" />
+          ))}
+        </div>
+      ) : q.isError && list.length === 0 ? (
+        <Card>
+          <LoadFailed
+            icon={Server}
+            title={t("servers.listFailedTitle")}
+            error={q.error}
+            onRetry={() => q.refetch()}
+          />
+        </Card>
+      ) : sorted.length === 0 ? (
+        <Card>
+          <EmptyState
+            illustration={list.length === 0 ? "servers" : "search"}
+            title={t("servers.notFound")}
+            description={list.length === 0 ? t("servers.emptyApi") : t("servers.emptySearch")}
+            action={
+              list.length > 0 && (search || onlyAvailable || series) ? (
+                <Button variant="outline" onClick={() => { setSearch(""); setOnlyAvailable(false); setSeries(""); }}>
+                  {t("history.clearFilters")}
+                </Button>
+              ) : undefined
+            }
+          />
+        </Card>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+          {sorted.map((srv) => (
+            <ServerCard
+              key={srv.planCode}
+              server={srv}
+              realtimeDcMap={availMap[srv.planCode]}
+              availError={availQ.isError}
+              price={priceMap[srv.planCode]}
+              priceLoading={catalogQ.isPending}
+              subsidiary={subsidiary}
+              onView={() => setDetailPlanCode(srv.planCode)}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* 详情弹窗 */}
+      <Dialog open={!!detailServer} onOpenChange={(v) => !v && setDetailPlanCode(null)}>
+        <DialogContent className="w-[95vw] sm:w-full sm:max-w-3xl max-h-[90vh] overflow-hidden flex flex-col">
+          {detailServer ? (
+            <DetailContent
+              key={`${activeAcc?.id || "default"}:${detailServer.planCode}`}
+              server={detailServer}
+              realtimeDcMap={availMap[detailServer.planCode]}
+              availError={availQ.isError}
+              variants={variantIndex[detailServer.planCode]}
+              defaultPrice={priceMap[detailServer.planCode]}
+              priceLoading={catalogQ.isPending}
+              catalogIdx={catalogIdx}
+              subsidiary={subsidiary}
+              onClose={() => setDetailPlanCode(null)}
+            />
+          ) : null}
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+/** 服务器卡片 */
+function ServerCard({
+  server,
+  realtimeDcMap,
+  availError,
+  price,
+  priceLoading,
+  subsidiary,
+  onView,
+}: {
+  server: ServerPlan;
+  realtimeDcMap?: Record<string, string>;
+  /** 实时库存接口挂了 —— 红点只是目录静态值,不能叫"缺货" */
+  availError?: boolean;
+  price?: PriceInfo;
+  /** 目录还在拉 → 显示"加载中";已拉完仍无价 → 显示"该子公司无报价" */
+  priceLoading: boolean;
+  subsidiary: string;
+  onView: () => void;
+}) {
+  const { t } = useTranslation();
+  const addMon = useAddToMonitor();
+
+  // 静态可用性兜底（首次渲染、实时还没回来时也有数据）
+  const staticDcMap = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const d of server.datacenters || []) {
+      m[d.datacenter.toLowerCase()] = d.availability;
+    }
+    return m;
+  }, [server.datacenters]);
+
+  // 实时覆盖静态：页面级单次 OVH 接口拿到的状态优先生效
+  const dcMap = useMemo(() => ({ ...staticDcMap, ...(realtimeDcMap || {}) }), [staticDcMap, realtimeDcMap]);
+
+  // 只有两态：明确可用 → 绿；其它一律视为缺货（红）
+  // 只列这台机器在当前账户站点真正可选的机房 —— 欧区机型不该出现 HIL/VIN。
+  // dcMap 已经是"静态目录 + 实时可用性"合并后的该机型机房集合。
+  const planDCs = useMemo(
+    () => datacentersForPlan({ [server.planCode]: dcMap }, server.planCode),
+    [dcMap, server.planCode]
+  );
+  const dcStatuses = planDCs.map((dc) => {
+    const status = lookupDcStatus(dcMap, dc);
+    const isOk = isOrderable(status);
+    return { dc, isOk };
+  });
+  const total = dcStatuses.length;
+  const okCount = dcStatuses.filter((s) => s.isOk).length;
+
+  // 库存接口挂了且这台机器没拿到实时数据 → 我们压根不知道有没有货。
+  // 这时候显示"暂时缺货"是假消息:用户会跳过一台其实能抢的机器。
+  const stockUnknown = !!availError && !realtimeDcMap;
+  const tone = stockUnknown ? "warning" : okCount > 0 ? "success" : "danger";
+  const statusText = stockUnknown
+    ? t("servers.card.stockUnknown")
+    : okCount > 0
+      ? t("servers.card.availableCount", { ok: okCount, total })
+      : t("servers.card.outOfStock");
+
+  return (
+    <Card className="overflow-hidden transition-colors hover:bg-secondary/30">
+      <CardContent className="p-5 flex flex-col gap-4">
+        {/* 头部：planCode + 状态 chip */}
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <h3 className="font-mono text-[15px] font-semibold truncate">{server.planCode}</h3>
+            {server.prerelease && <Chip tone="warning">{t("commons.planCode.prerelease")}</Chip>}
+            <p className="text-[12px] text-muted-foreground truncate mt-0.5">{server.name}</p>
+            <div className="text-[13px] font-semibold mt-1 tabular-nums">
+              {price ? (
+                formatPrice(price)
+              ) : (
+                <PriceFallback loading={priceLoading} subsidiary={subsidiary} prerelease={server.prerelease} />
+              )}
+            </div>
+          </div>
+          <Chip tone={tone as any} title={stockUnknown ? t("servers.card.stockUnknownTitle") : undefined}>
+            <StatusDot
+              tone={stockUnknown ? "warning" : okCount > 0 ? "success" : "danger"}
+              pulse={!stockUnknown && okCount > 0}
+              size="xs"
+            />
+            {statusText}
+          </Chip>
+        </div>
+
+        {/* 规格 2x2 */}
+        <div className="grid grid-cols-2 gap-2 text-[12px]">
+          <SpecRow icon={<Cpu className="w-3.5 h-3.5" />} text={server.prerelease && server.cpu === "—" ? t("queue.preorderCPUPending") : server.cpu} />
+          <SpecRow icon={<MemoryStick className="w-3.5 h-3.5" />} text={server.memory} />
+          <SpecRow icon={<HardDrive className="w-3.5 h-3.5" />} text={server.storage} />
+          <SpecRow icon={<Wifi className="w-3.5 h-3.5" />} text={server.bandwidth} />
+        </div>
+
+        {/* DC 点阵：12 个标准 OVH DC，只两态 — 绿色有货 / 红色缺货 */}
+        <div className="flex flex-wrap items-center gap-1.5 py-1">
+          {dcStatuses.map(({ dc, isOk }) => (
+            <span
+              key={dc.code}
+              title={`${dc.name} · ${dc.region}`}
+              className="inline-flex items-center gap-1 px-1.5 h-5 rounded-full border border-border text-[10px] font-mono"
+            >
+              <StatusDot tone={isOk ? "success" : "danger"} size="xs" pulse={isOk} />
+              {dc.code.toUpperCase()}
+            </span>
+          ))}
+        </div>
+
+        {/* 操作按钮 */}
+        <div className="flex items-center gap-2 pt-1">
+          <Button
+            variant="outline"
+            size="sm"
+            className="flex-1"
+            disabled={addMon.isPending}
+            onClick={() =>
+              addMon.mutate({
+                planCode: server.planCode,
+                datacenters: planDCs.map((dc) => dc.code),
+                serverName: server.name,
+              })
+            }
+          >
+            <Bell className="w-3.5 h-3.5" />
+            {t("servers.card.monitor")}
+          </Button>
+          <Button size="sm" className="flex-1" onClick={onView}>
+            <ShoppingCart className="w-3.5 h-3.5" />
+            {t("servers.card.snipe")}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** 单行规格（icon + 文本） */
+function SpecRow({ icon, text }: { icon: React.ReactNode; text: string }) {
+  return (
+    <div className="flex items-center gap-1.5 min-w-0 text-foreground/80">
+      <span className="text-muted-foreground flex-shrink-0">{icon}</span>
+      <span className="truncate" title={text}>{text}</span>
+    </div>
+  );
+}
+
+/** 详情弹窗内容 */
+function DetailContent({
+  server,
+  realtimeDcMap,
+  availError,
+  variants,
+  defaultPrice,
+  priceLoading,
+  catalogIdx,
+  subsidiary,
+  onClose,
+  editing,
+}: {
+  /** 编辑已有抢购任务:账户与型号固定,保存时更新该任务;多选的其他机房各新增一个任务 */
+  editing?: QueueItem;
+  server: ServerPlan;
+  realtimeDcMap?: Record<string, string>;
+  /** 页面级实时库存接口挂了 */
+  availError?: boolean;
+  /** 此 planCode 在 OVH availability 接口里的所有 FQN 变体 */
+  variants?: AvailabilityItem[];
+  /** 用默认配置算出的代表价，作为用户尚未变动时的兜底显示 */
+  defaultPrice?: PriceInfo;
+  priceLoading: boolean;
+  /** 目录索引：用户切配置时实时算价用 */
+  catalogIdx: CatalogIndex;
+  /** 仅用于价格展示的 subsidiary（顶部下拉决定）。实际下单 subsidiary 由后端 cfg.Zone 决定，在设置页改 */
+  subsidiary: string;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const addMon = useAddToMonitor();
+  const create = useCreateQueueItem();
+  const update = useUpdateQueueItem();
+  const defaultAcc = useDefaultAccount();
+  const { data: accounts } = useAccounts();
+
+  // 下单账户 = 左侧菜单栏(手机端在顶栏)选的那个全局账户,这里不再单独选。
+  // 拿不到时退回默认账户,避免刚装好还没选就点不了下单。
+  const [globalAccountId] = useActiveAccount();
+  const accountId = (editing && findAccountByID(accounts, editing.accountId)?.id) || findAccountByID(accounts, globalAccountId)?.id || defaultAcc?.id || "";
+  const activeAccount = findAccountByID(accounts, accountId);
+
+  // 这里选的下单账户可能跟页面顶部的活跃账户不是同一个区。
+  // 库存必须按"实际下单的那个账户"的站点查:EU/US/CA 三站库存互不相通
+  // (实测 US 站点有 423 个 planCode,只有 134 个与 EU 重合,还多 vin/hil 两个机房),
+  // 拿页面级(活跃账户)的库存去点红绿点,用户会照着别区的货去下单。
+  const orderEndpoint = findAccountByID(accounts, accountId)?.endpoint || "";
+  const orderAvail = useAvailability(orderEndpoint || undefined);
+  // 下单账户那一份还没到手时,先用页面级传进来的变体兜底显示(不空窗)
+  const orderVariants = useMemo(
+    () => (orderEndpoint ? variantsForPlan(orderAvail.data, server.planCode) ?? variants : variants),
+    [orderEndpoint, orderAvail.data, server.planCode, variants]
+  );
+  // plan 级机房状态同样改用下单账户那一份(空 picks = 聚合所有变体,与页面卡片口径一致)
+  const orderDcMap = useMemo(
+    () => (orderVariants ? variantDcStatus(orderVariants, []) : realtimeDcMap),
+    [orderVariants, realtimeDcMap]
+  );
+  const [selectedDCs, setSelectedDCs] = useState<string[]>(() => (editing ? [editing.datacenter.toLowerCase()] : []));
+  const [quantity, setQuantity] = useState("1");
+  const [chosenScope, setChosenScope] = useState<PurchaseMode | "">("");
+  // 重试间隔与购买时长记住上次的选择(只存在本机浏览器);自动付款涉及扣款,不记
+  const [retryInterval, setRetryInterval] = useState(() => (editing ? String(editing.retryInterval || 60) : loadBuyPrefs().retryInterval || "60"));
+  // 默认不自动付款:自动扣钱必须是用户显式打开的
+  const [autoPay, setAutoPay] = useState(!!editing?.autoPay);
+  const dcSectionRef = useRef<HTMLDivElement>(null);
+  const [dcFlash, setDcFlash] = useState(false);
+  const [preorderPlan, setPreorderPlan] = useState(server.prerelease ? server.planCode : "");
+  const preorder = !!server.prerelease || preorderPlan === server.planCode;
+  // 没手动选过时:选了多个机房默认「合计 N 台」(哪个机房先有货就买哪个,买够即停)。
+  // 以前默认「每个机房各买」,勾 7 个机房就是 7 台 —— 多数人只是想提高抢到的机会,不是想买 7 台。
+  const purchaseMode: PurchaseMode = chosenScope || (preorder || selectedDCs.length > 1 ? "total" : "perDatacenter");
+  useEffect(() => setPreorderPlan((previous) => retainPreorderPlan(previous, server.planCode, !!server.prerelease)), [server.planCode, server.prerelease]);
+  const [duration, setDuration] = useState(() => editing?.duration || loadBuyPrefs().duration || "P1M");
+  const [coupon, setCoupon] = useState(editing?.coupon || "");
+  const [preorderTrigger, setPreorderTrigger] = useState<PreorderTrigger>("onSale");
+  // 多账户:默认上次在该型号用过的同区账户,其次是当前账户。
+  const [pickedAccounts, setPickedAccounts] = useState<string[]>([]);
+  const orderRegionKey = endpointRegion(activeAccount?.endpoint);
+  const orderAccounts = useMemo(() => {
+    const valid = (ids: string[]) =>
+      ids.filter((id) => {
+        const acc = findAccountByID(accounts, id);
+        return !!acc && endpointRegion(acc.endpoint) === orderRegionKey;
+      });
+    if (editing) return accountId ? [accountId] : [];
+    const chosen = valid(pickedAccounts);
+    if (chosen.length > 0) return chosen;
+    const remembered = valid(rememberedAccounts(server.planCode));
+    if (remembered.length > 0) return remembered;
+    return accountId ? [accountId] : [];
+  }, [pickedAccounts, accounts, orderRegionKey, server.planCode, accountId, editing]);
+  const toggleDC = (code: string) =>
+    setSelectedDCs((prev) => (prev.includes(code) ? prev.filter((c) => c !== code) : [...prev, code]));
+  // 和后端同一套上限:界面上先把数量收住,别让用户看到一个建不出来的数字。
+  // 真正的闸门在后端 EnqueueItems,这里只是提前说清楚。
+  const orderPlan = clampOrderPlan(selectedDCs.length * Math.max(1, orderAccounts.length), Number(quantity) || 1);
+  const qty = orderPlan.quantity;
+  const totalTasks = orderPlan.total;
+  // 静态可用性兜底：实时还没返回时也能看到目录里的初始数据
+  const staticDcMap = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const d of server.datacenters || []) m[d.datacenter.toLowerCase()] = d.availability;
+    return m;
+  }, [server.datacenters]);
+  // 实时覆盖静态:plan 级聚合,无 variants 数据时兜底
+  const aggregateDcMap = useMemo(() => ({ ...staticDcMap, ...(orderDcMap || {}) }), [staticDcMap, orderDcMap]);
+
+  // 按组拆分可选配置 + 默认值集合
+  const grouped = useMemo(() => groupOptions(server.availableOptions), [server.availableOptions]);
+  const defaultValueSet = useMemo(
+    () => new Set((server.defaultOptions || []).map((o) => o.value)),
+    [server.defaultOptions]
+  );
+
+  // 各组的当前选中值（按 group key 索引）。默认从 catalog 的 defaultOptions 里取该组里命中的那个 value。
+  // 用户切配置后,每个 option chip / 每个 DC 的红绿点会实时反映"这套组合是否有 DC 有货",
+  // 用户看到红就自己换 —— 不替用户自动改默认值。
+  const initialPicked = useMemo(() => {
+    const out: Partial<Record<OptionGroupKey, string>> = {};
+    (Object.keys(grouped) as OptionGroupKey[]).forEach((g) => {
+      const list = grouped[g];
+      if (list.length === 0) return;
+      // 编辑时回填任务当前的配置;没有匹配项的组退回目录默认值
+      const current = editing ? list.find((o) => (editing.options || []).includes(o.value)) : undefined;
+      const def = current || list.find((o) => defaultValueSet.has(o.value));
+      if (def) out[g] = def.value;
+    });
+    return out;
+  }, [grouped, defaultValueSet, editing]);
+  // 任务上有、但不在目录可选项里的配置码(手填的附加项):编辑保存时原样保留
+  const extraOptions = useMemo(() => {
+    if (!editing) return [] as string[];
+    const known = new Set((Object.keys(grouped) as OptionGroupKey[]).flatMap((g) => grouped[g].map((o) => o.value)));
+    return (editing.options || []).filter((o) => !known.has(o));
+  }, [editing, grouped]);
+  const [picked, setPicked] = useState<Partial<Record<OptionGroupKey, string>>>(initialPicked);
+
+  // DC 红绿:看"该 DC 在任何 FQN 里有货否",跟卡片外面口径一致。
+  // 用户看 DC 红绿决定去哪个机房,看 option chip 红绿决定换什么配置。
+  // 当前完整选配 vs 实际可下单的精确校验放到提交按钮那一步处理(待加)。
+  const dcMap = aggregateDcMap;
+  // 该机型在当前账户站点真正可选的机房。写死 16 个会让欧区机型列出 HIL/VIN 这种
+  // 永远买不到的机房,美区账户同样会看到一堆自己订不了的欧洲机房。
+  const dialogDCs = useMemo(
+    () => datacentersForPlan({ [server.planCode]: dcMap }, server.planCode),
+    [dcMap, server.planCode]
+  );
+
+  useEffect(() => {
+    if (!editing || dialogDCs.length === 0) return;
+    setSelectedDCs((prev) => {
+      const next = prev.map((c) => dialogDCs.find((d) => apiDatacenterCode(d.code) === apiDatacenterCode(c))?.code || c);
+      return next.join() === prev.join() ? prev : next;
+    });
+  }, [editing, dialogDCs]);
+
+  const total = dialogDCs.length;
+  const ok = dialogDCs.filter((dc) => {
+    const status = lookupDcStatus(dcMap, dc);
+    return isOrderable(status);
+  }).length;
+  const ratio = total > 0 ? ok / total : 0;
+
+  // 这个弹窗里的库存有两个来源:换了下单账户时走 orderAvail(该账户所在站点),
+  // 否则用页面级那一份。哪一份挂了就得说哪一份挂了 —— 用户正要在这里按下抢购,
+  // 把"没问到"画成红色"暂时缺货"是这个工具能犯的最严重的谎。
+  const stockFailed = orderEndpoint ? orderAvail.isError : !!availError;
+  const stockUnknown = stockFailed && !orderDcMap;
+
+  // option chip 上的有货预判。
+  // OVH availability FQN 只包含 planCode.memory.storage[.systemStorage] 三段,
+  // 带宽 / vRack / CPU / other 这些 addon 不在 FQN 里 → 它们的库存跟主机解耦,
+  // 主机有货就总能加购,这些组固定绿,不参与 FQN 匹配。
+  const optionHasStock = (groupKey: OptionGroupKey, value: string): boolean => {
+    if (groupKey === "bandwidth" || groupKey === "vrack" || groupKey === "cpu" || groupKey === "other") {
+      return true;
+    }
+    return hasStockWithOption(orderVariants, picked as Record<string, string>, groupKey, value);
+  };
+
+  // 用户选中的所有 option value（非默认值才计入，让 Queue 表单只填差异化部分；
+  // 但保险起见全量传过去，让后端忽略相同默认值即可）
+  const selectedValues = useMemo(
+    () => {
+      const options = Object.values(picked).filter(Boolean) as string[];
+      const base = preorder ? preorderOptions(options, grouped.cpu.map((option) => option.value)) : options;
+      return extraOptions.length ? [...base, ...extraOptions.filter((o) => !base.includes(o))] : base;
+    },
+    [picked, preorder, grouped, extraOptions]
+  );
+  const preorderConfigMismatch = preorder && (!hasPreorderHardware(selectedValues) || (selectedValues.length > 0 &&
+    !!orderVariants?.length && !orderVariants.some((v) => preorderVariantCoversAll(v.fqn, selectedValues))));
+  const durationOptions = useOrderDurations(accountId, server.planCode, "eco", true);
+  const durationSupported = supportsDuration(durationOptions.data, duration);
+  // 记住的时长这款机型不支持时,退回 1 个月,不让用户卡在一个选不了的值上
+  useEffect(() => {
+    if (durationOptions.data && !durationSupported && duration !== "P1M") setDuration("P1M");
+  }, [durationOptions.data, durationSupported, duration]);
+  const preparation = useOrderPrewarm(!editing && durationSupported && !!accountId && selectedDCs.length > 0 && !preorderConfigMismatch, {
+    account_id: accountId, planCode: server.planCode, datacenters: selectedDCs,
+    options: selectedValues, quantity: qty, autoPay, coupon, duration, preorder,
+  });
+
+  // 价格用的 subsidiary(顶部下拉)属于哪个站点 vs 下单账户属于哪个站点
+  const priceRegion = endpointRegion(
+    OVH_SUBSIDIARIES.find((s) => s.code === subsidiary)?.endpoint || "ovh-eu"
+  );
+  const orderRegion = endpointRegion(orderEndpoint);
+  const priceRegionMismatch = !!orderEndpoint && priceRegion !== orderRegion;
+
+  // 跟随选配实时算价：base plan + 选中的各 addon 月费
+  const price = useMemo(() => {
+    if (selectedValues.length === 0) return defaultPrice;
+    return computePriceFromOptions(server.planCode, selectedValues, catalogIdx) || defaultPrice;
+  }, [server.planCode, selectedValues, catalogIdx, defaultPrice]);
+
+  return (
+    <>
+      <DialogHeader>
+        <div className="flex items-start justify-between gap-3 pr-6">
+          <div className="min-w-0">
+            <DialogTitle className="font-mono text-xl truncate">{server.planCode}</DialogTitle>
+            <DialogDescription className="truncate mt-0.5">{server.name}</DialogDescription>
+          </div>
+          {server.prerelease ? (
+            <Chip tone="warning">{t("queue.preorderAwaitCatalog")}</Chip>
+          ) : stockUnknown ? (
+            <Chip tone="warning"><StatusDot tone="warning" size="xs" />{t("servers.detail.stockUnknown")}</Chip>
+          ) : ok > 0 ? (
+            <Chip tone="success"><StatusDot tone="success" pulse size="xs" />{t("servers.detail.currentlyAvailable")}</Chip>
+          ) : (
+            <Chip tone="danger"><StatusDot tone="danger" size="xs" />{t("servers.detail.outOfStock")}</Chip>
+          )}
+        </div>
+      </DialogHeader>
+
+      <div className="overflow-y-auto -mx-4 px-4 sm:-mx-6 sm:px-6 space-y-6 flex-1">
+        {preorder && <p className="text-xs text-warning" role="status">{t("queue.preorderHint")}</p>}
+        {editing && (
+          <div className="flex flex-wrap items-center gap-2 rounded-xl border border-primary/30 bg-primary/[.04] px-3.5 py-2.5 text-[12.5px]">
+            <Pencil className="w-3.5 h-3.5 text-primary" />
+            <span className="font-medium">{t("queue.editTitle")}</span>
+            <AccountChip accountId={editing.accountId} />
+            <span className="text-muted-foreground">{t("servers.detail.editHint")}</span>
+          </div>
+        )}
+        {preorder && !editing && <PreorderTriggerPicker value={preorderTrigger} onChange={setPreorderTrigger} />}
+        {accounts && accountId && !editing && (
+          <OrderAccountPicker accounts={accounts} primaryId={accountId} selected={orderAccounts} onChange={setPickedAccounts} />
+        )}
+        {/* 价格 Hero（随下方配置实时变化） */}
+        <div className="border border-border rounded-2xl p-4 bg-secondary/30 flex items-end justify-between gap-3 flex-wrap">
+          <div>
+            <div className="text-[11px] text-muted-foreground">
+              {t("servers.detail.monthlyFee", { subsidiary })}
+              <span className="ml-2 text-[10px]">
+                {selectedValues.length > 0 ? t("servers.detail.withOptions") : t("servers.detail.defaultConfig")}
+              </span>
+            </div>
+            <div className="text-2xl font-bold tabular-nums mt-0.5">
+              {price ? (
+                formatPrice(price)
+              ) : (
+                <span className="text-base">
+                  <PriceFallback loading={priceLoading} subsidiary={subsidiary} prerelease={preorder} />
+                </span>
+              )}
+            </div>
+          </div>
+          {price && (
+            <div className="text-right text-[11px] text-muted-foreground space-y-0.5 tabular-nums">
+              {price.installPrice > 0 && (
+                <div>{t("servers.detail.installFee", { amount: formatMoney(price.installPrice, price.currency) })}</div>
+              )}
+              {/* 币种取目录 locale.currencyCode 原值;拿不到就明说未知,不写死 EUR */}
+              <div title={price.currency ? undefined : currencyUnknownHint()}>
+                {t("servers.detail.currency", {
+                  currency: price.currency || t("servers.detail.currencyUnknownValue"),
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 规格 4 卡 */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5 sm:gap-3">
+          <SpecCard icon={<Cpu className="w-4 h-4" />} label="CPU" value={server.prerelease && server.cpu === "—" ? t("queue.preorderCPUPending") : server.cpu} />
+          <SpecCard icon={<MemoryStick className="w-4 h-4" />} label={t("servers.spec.memory")} value={server.memory} />
+          <SpecCard icon={<HardDrive className="w-4 h-4" />} label={t("servers.spec.storage")} value={server.storage} />
+          <SpecCard icon={<Wifi className="w-4 h-4" />} label={t("servers.spec.bandwidth")} value={server.bandwidth} />
+        </div>
+
+        {/* 硬件配置选择 */}
+        {(["cpu", "memory", "systemStorage", "storage", "bandwidth", "vrack", "other"] as OptionGroupKey[])
+          .filter((g) => grouped[g].length > 0 && !(preorder && g === "cpu"))
+          .map((g) => (
+            <OptionGroupSection
+              key={g}
+              groupKey={g}
+              options={grouped[g]}
+              picked={picked[g] || ""}
+              defaultValueSet={defaultValueSet}
+              hasStock={variants && variants.length > 0 ? (value) => optionHasStock(g, value) : undefined}
+              onPick={(value) => setPicked((p) => ({ ...p, [g]: value }))}
+            />
+          ))}
+        {preorderConfigMismatch && <p className="text-xs text-destructive" role="alert">{t(!hasPreorderHardware(selectedValues) ? "queue.selectHardwareFirst" : "queue.preorderConfigMismatch")}</p>}
+
+        {/* 库存接口挂了 —— 下面的红绿点这时候不代表真实库存,必须在按下抢购之前说清楚。 */}
+        {stockFailed && (
+          <LoadFailedBanner
+            title={t("servers.detail.availFailedTitle")}
+            error={orderEndpoint ? orderAvail.error : undefined}
+            onRetry={() => (orderEndpoint ? orderAvail.refetch() : undefined)}
+          />
+        )}
+
+        {/* DC 多选（点击切换） + 全选/反选。底部「选择数据中心」会滚到这里并闪一下 */}
+        <div
+          ref={dcSectionRef}
+          className={`scroll-mt-4 rounded-xl transition-shadow duration-500 ${dcFlash ? "ring-2 ring-primary/60 ring-offset-4 ring-offset-background" : ""}`}
+        >
+          <div className="flex items-center justify-between mb-2.5 gap-2 flex-wrap">
+            <h3 className="text-[13px] font-semibold flex items-center gap-1.5">
+              <MapPin className="w-3.5 h-3.5 text-muted-foreground" />
+              {t("servers.detail.dcHeader", { selected: selectedDCs.length, total: dialogDCs.length })}
+            </h3>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-muted-foreground">
+                {stockUnknown
+                  ? t("servers.detail.stockUnknown")
+                  : t("servers.detail.dcSummary", { ok, total, pct: Math.round(ratio * 100) })}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-[11px]"
+                onClick={() => {
+                  // 全选可用的；都满了就清空
+                  const okCodes = dialogDCs
+                    .filter((dc) => {
+                      const s = lookupDcStatus(dcMap, dc);
+                      return isOrderable(s);
+                    })
+                    .map((dc) => dc.code);
+                  setSelectedDCs(selectedDCs.length === okCodes.length ? [] : okCodes);
+                }}
+                title={t("servers.detail.selectAllTitle")}
+              >
+                {selectedDCs.length > 0 ? t("servers.detail.clear") : t("servers.detail.selectAvailable")}
+              </Button>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-1.5 sm:gap-2">
+            {dialogDCs.map((dc) => {
+              const status = lookupDcStatus(dcMap, dc);
+              const isOk = isOrderable(status);
+              const isSelected = selectedDCs.includes(dc.code);
+              return (
+                <button
+                  key={dc.code}
+                  type="button"
+                  onClick={() => toggleDC(dc.code)}
+                  className={
+                    "text-left border rounded-xl px-3 py-2 flex items-center justify-between transition-colors " +
+                    (isSelected
+                      ? "border-foreground bg-foreground text-background"
+                      : "border-border hover:bg-secondary/50")
+                  }
+                >
+                  <div className="min-w-0">
+                    <div className="text-[12px] font-bold font-mono">{dc.code.toUpperCase()}</div>
+                    <div className={"text-[10px] truncate " + (isSelected ? "text-background/70" : "text-muted-foreground")}>
+                      {dc.region} · {dc.name}
+                    </div>
+                  </div>
+                  <StatusDot tone={isOk ? "success" : "danger"} size="sm" pulse={isOk && !isSelected} />
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* 抢购参数：账户 / 数量 / 重试间隔 */}
+        <div className="border-t border-border pt-4">
+          <h3 className="text-[13px] font-semibold mb-2.5 flex items-center gap-1.5">
+            <ShoppingCart className="w-3.5 h-3.5 text-muted-foreground" />
+            {t("servers.detail.params")}
+          </h3>
+          <div className="space-y-3">
+            <OrderDurationField value={duration} onChange={setDuration} query={durationOptions} />
+
+            <div>
+              {/* 当前账户不在这里重复 —— 切换器在顶栏(手机)/侧栏(桌面)始终可见。
+                  下面这句留着:它说的不是"账户是谁",而是"这些红绿点是按哪个站点查的",
+                  库存判断的口径跟着账户走,这是本页独有的信息。 */}
+              {orderEndpoint && (
+                <p className="text-[11px] text-muted-foreground mt-1">
+                  {t("servers.detail.availByRegion", { region: regionLabel(endpointRegion(orderEndpoint)) })}
+                  {orderAvail.isFetching && t("servers.detail.syncing")}
+                </p>
+              )}
+              {/* 下单前唯一能看出"区配错了"的地方:价格按上方选的 subsidiary 显示,
+                  下单却走账户所属站点。两者不同区时价格/库存都对不上,必须显式警告。 */}
+              {priceRegionMismatch && (
+                <p className="text-[11px] text-warning mt-1">
+                  {t("servers.detail.regionMismatch", {
+                    subsidiary,
+                    priceRegion: regionLabel(priceRegion),
+                    orderRegion: regionLabel(orderRegion),
+                  })}
+                </p>
+              )}
+            </div>
+            {!editing && purchaseMode === "total" && <p className="text-sm font-medium">{t("queue.totalMaximum", { n: qty })}</p>}
+            {!editing && <OrderPurchaseScope id="server-purchase-scope" value={purchaseMode} onChange={setChosenScope} />}
+            <div className={editing ? "hidden" : "grid grid-cols-1 gap-3"}>
+              <div>
+                <label className="block text-[11px] text-muted-foreground mb-1">
+                  {t(purchaseMode === "total" ? "queue.qtyTotal" : "servers.detail.qtyPerDc")}
+                  <span className="ml-1 opacity-60">{t("servers.detail.qtyMax", { n: MAX_ORDER_QUANTITY })}</span>
+                </label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={MAX_ORDER_QUANTITY}
+                  value={quantity}
+                  onChange={(e) => setQuantity(e.target.value)}
+                />
+                {orderPlan.clamped && (
+                  // 光靠 max= 挡不住手打的值,得把实际会用的数字说出来
+                  <p className="text-[11px] text-warning mt-1">
+                    {t("servers.detail.clamped", { qty, max: MAX_ORDER_FANOUT })}
+                  </p>
+                )}
+              </div>
+            </div>
+            {/* 不常改的两项收起来:优惠码、重试间隔。填了优惠码时保持展开 */}
+            <details className="group rounded-xl border border-border" open={!!coupon || !!editing || undefined}>
+              <summary className="flex items-center justify-between gap-2 px-3.5 py-2.5 text-[13px] font-medium list-none [&::-webkit-details-marker]:hidden">
+                <span>{t("servers.detail.moreOptions")}</span>
+                <span className="flex items-center gap-2 text-[12px] font-normal text-muted-foreground">
+                  {t("servers.detail.moreSummary", { interval: retryInterval || "60" })}
+                  <ChevronDown className="w-4 h-4 transition-transform group-open:rotate-180" />
+                </span>
+              </summary>
+              <div className="space-y-3 border-t border-border px-3.5 py-3">
+            <div>
+                  <label htmlFor="server-coupon" className="block text-[13px] font-medium mb-1.5">
+                    {t("queue.couponLabel")}
+                  </label>
+                  <Input id="server-coupon" value={coupon} onChange={(e) => setCoupon(e.target.value)}
+                    placeholder={t("queue.couponPlaceholder")} autoCapitalize="none" spellCheck={false}
+                    aria-describedby="server-coupon-hint" />
+                  <p id="server-coupon-hint" className="text-[11px] text-muted-foreground mt-1">
+                    {t("queue.couponHint")}
+                  </p>
+                </div>
+              <div>
+                <label className="block text-[11px] text-muted-foreground mb-1">{t("servers.detail.retryInterval")}</label>
+                <Input
+                  type="number"
+                  min={10}
+                  value={retryInterval}
+                  onChange={(e) => setRetryInterval(e.target.value)}
+                />
+              </div>
+              </div>
+            </details>
+          </div>
+        </div>
+        {/* 手机:底部 sheet 高度有限,自动付款卡片放进可滚动正文末尾,把屏幕留给配置 */}
+        <AutoPayOption
+          className="sm:hidden"
+          checked={autoPay}
+          onChange={setAutoPay}
+          accountIds={orderAccounts}
+          title={t("queue.autoPay")}
+          description={autoPay ? t("queue.autoPayOn") : t("queue.autoPayOff")}
+        />
+      </div>
+
+      {/* 自动付款:以前藏在底部一行小字里,要先选机房才出现。改成正文里的选项卡片,始终可见。
+          checkout 只传 autoPayWithPreferredPaymentMethod,不传 waiveRetractationPeriod(保留 14 天撤回权)。 */}
+      <AutoPayOption
+        className="hidden sm:block"
+        checked={autoPay}
+        onChange={setAutoPay}
+        accountIds={orderAccounts}
+        title={t("queue.autoPay")}
+        description={autoPay ? t("queue.autoPayOn") : t("queue.autoPayOff")}
+      />
+
+      <OrderPrewarm preparation={preparation} />
+      {/* 手机:说明占一整行,下面「加入监控 / 创建」并排一行;关闭交给右上角 × 和下拉手势 */}
+      <DialogFooter className="border-t border-border pt-3 sm:pt-4 -mx-4 px-4 sm:-mx-6 sm:px-6 max-sm:grid max-sm:grid-cols-2 max-sm:gap-2">
+        <div className="mr-auto text-[12px] text-muted-foreground max-sm:col-span-2">
+          <div className="mb-1 font-medium text-foreground">{t("orderDuration.label")} · <OrderDurationLabel value={duration} /></div>
+          {editing && selectedDCs.length > 0
+            ? (selectedDCs.length > 1 ? t("queue.editMultiDcHint", { n: selectedDCs.length - 1 }) : t("servers.detail.editOneDc"))
+            : selectedDCs.length > 0
+            ? t(purchaseMode === "total" ? "queue.totalMaximum" : "servers.detail.willCreate", {
+                n: qty,
+                tasks: totalTasks,
+                dcs: selectedDCs.length,
+                qty,
+                extra:
+                  selectedValues.length > 0
+                    ? t("servers.detail.willCreateExtra", { n: selectedValues.length })
+                    : "",
+              })
+            : (
+              <button
+                type="button"
+                onClick={() => {
+                  dcSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+                  setDcFlash(true);
+                  window.setTimeout(() => setDcFlash(false), 1400);
+                }}
+                className="inline-flex items-center gap-1 font-medium text-primary hover:underline underline-offset-2"
+              >
+                <MapPin className="w-3.5 h-3.5" />
+                {t("servers.detail.pickDc")}
+                <ArrowDown className="w-3.5 h-3.5" />
+              </button>
+            )}
+          {selectedDCs.length > 0 && autoPay && (
+            <span className="block text-[11px] mt-0.5 text-warning">{t("servers.detail.autoPayOn")}</span>
+          )}
+        </div>
+        <Button variant="outline" className="max-sm:hidden" onClick={onClose} disabled={create.isPending || update.isPending}>
+          {t("servers.detail.close")}
+        </Button>
+        {editing && (
+          <Button
+            className="max-sm:col-span-2"
+            disabled={!durationSupported || selectedDCs.length === 0 || update.isPending || create.isPending}
+            onClick={async () => {
+              // 一个任务对应一个机房:原机房仍勾着就留给原任务,其余每个机房按同样设置各新增一个任务
+              const same = (a: string, b: string) => apiDatacenterCode(a) === apiDatacenterCode(b);
+              const keep = selectedDCs.find((d) => same(d, editing.datacenter)) || selectedDCs[0];
+              const extra = selectedDCs.filter((d) => d !== keep);
+              const interval = Number(retryInterval) || 60;
+              try {
+                await update.mutateAsync({
+                  id: editing.id,
+                  wasRunning: editing.status === "running" || editing.status === "pending",
+                  datacenter: keep,
+                  options: selectedValues,
+                  retryInterval: interval,
+                  autoPay,
+                  coupon: coupon.trim(),
+                  duration,
+                });
+              } catch {
+                return; // 错误已由保存逻辑提示,保留弹窗
+              }
+              if (extra.length > 0) {
+                const r = await create.mutateAsync({
+                  account_id: editing.accountId,
+                  planCode: editing.planCode,
+                  datacenters: extra,
+                  quantity: 1,
+                  purchaseMode: "perDatacenter",
+                  retryInterval: interval,
+                  options: selectedValues,
+                  autoPay,
+                  coupon,
+                  duration,
+                  preorder: !!editing.preorder,
+                });
+                if (r.success > 0) toast.success(t("queue.editExtraCreated", { n: r.success }));
+                if (r.failed > 0) return;
+              }
+              onClose();
+            }}
+          >
+            {update.isPending || create.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+            {t("queue.save")}
+          </Button>
+        )}
+        {!editing && (<>
+        <Button
+          variant="outline"
+          disabled={addMon.isPending || create.isPending}
+          onClick={() =>
+            addMon.mutate({
+              duration,
+              planCode: server.planCode,
+              // 跟着用户在上面勾的机房走。以前这里固定传 dialogDCs(全部机房),
+              // 用户勾了 GRA 却会收到所有机房的补货通知。
+              // 一个都没勾才按"监控所有"处理 —— 那是明确的空选。
+              datacenters:
+                selectedDCs.length > 0 ? selectedDCs : dialogDCs.map((dc) => dc.code),
+              // 选配也要带上。订阅本身是支持 options 的(后端 AddSubscription
+              // 有这个字段),漏传的后果是:用户特意选了 64G 内存 + 2x960 SSD,
+              // 加进监控后盯的却是这个 planCode 底下的**所有**配置组合 ——
+              // 通知按每套配置逐套触发,之后若在监控页打开自动下单,
+              // 抢到的会是基础配置那台。
+              options: selectedValues,
+              serverName: server.name,
+            })
+          }
+        >
+          <Bell className="w-4 h-4" />
+          {t("servers.detail.addToMonitor")}
+        </Button>
+        <Button
+          disabled={!durationSupported || selectedDCs.length === 0 || create.isPending || preorderConfigMismatch}
+          onClick={async () => {
+            if (selectedDCs.length === 0) {
+              toast.error(t("servers.toast.pickDc"));
+              return;
+            }
+            if (!accountId) {
+              toast.error(t("servers.toast.pickAccount"));
+              return;
+            }
+            const result = await create.mutateAsync({
+              account_id: accountId,
+              account_ids: orderAccounts.length > 0 ? orderAccounts : [accountId],
+              preorderWaitStock: preorder && preorderTrigger === "inStock",
+              planCode: server.planCode,
+              datacenters: selectedDCs,
+              quantity: qty,
+              retryInterval: Number(retryInterval) || 60,
+              options: selectedValues,
+              autoPay,
+              coupon,
+              duration,
+              preorder,
+              purchaseMode,
+            });
+            if (result.success > 0) {
+              rememberAccounts(server.planCode, orderAccounts);
+              saveBuyPrefs({ retryInterval: String(Number(retryInterval) || 60), duration });
+              preparation.submitted();
+              toast.success(t("servers.toast.created", { success: result.success, total: result.total }), {
+                action: { label: t("servers.toast.viewQueue"), onClick: () => void navigate({ to: "/queue" }) },
+              });
+              onClose();
+            }
+            if (result.failed > 0) {
+              toast.error(t("servers.toast.failedCount", { n: result.failed }));
+            }
+          }}
+        >
+          {create.isPending ? (
+            <>
+              <Loader2 className="w-4 h-4 animate-spin" />
+              {t("servers.detail.creating")}
+            </>
+          ) : (
+            <>
+              <ShoppingCart className="w-4 h-4" />
+              {preorder
+                ? t(selectedDCs.length > 0 ? "queue.createPreorder" : "queue.createPreorderAction", { n: totalTasks })
+                : selectedDCs.length > 0 ? t("servers.detail.createN", { n: totalTasks }) : t("servers.detail.create")}
+            </>
+          )}
+        </Button>
+        </>)}
+      </DialogFooter>
+    </>
+  );
+}
+
+/**
+ * 抢购队列的「编辑」弹窗:与服务器列表的抢购弹窗同一个界面(价格、规格、带库存的配置与机房),
+ * 数据按任务所属账户读取。目录里找不到这款机型时调用 onUnavailable,由调用方退回简易表单。
+ */
+export function QueueEditDialog({ editing, onClose, onUnavailable }: { editing: QueueItem | null; onClose: () => void; onUnavailable: (item: QueueItem) => void }) {
+  const accounts = useAccounts();
+  const acc = findAccountByID(accounts.data, editing?.accountId || "");
+  const q = useServers(true, editing?.accountId);
+  const availQ = useAvailability(acc?.endpoint || undefined);
+  const subsidiary = (acc?.zone || "IE").toUpperCase();
+  const catalogQ = useOvhCatalog(subsidiary);
+  const catalogIdx = useMemo(() => buildCatalogIndex(catalogQ.data), [catalogQ.data]);
+  const list = useMemo(() => mergeStockPlans(q.data || [], availQ.data), [q.data, availQ.data]);
+  const server = editing ? list.find((s) => s.planCode === editing.planCode) : undefined;
+  const availMap = useMemo(() => buildAvailabilityMap(availQ.data), [availQ.data]);
+  const variantIndex = useMemo(() => buildVariantIndex(availQ.data), [availQ.data]);
+  const defaultPrice = useMemo(
+    () => (server ? computePriceFromOptions(server.planCode, (server.defaultOptions || []).map((o) => o.value).filter(Boolean), catalogIdx) || undefined : undefined),
+    [server, catalogIdx],
+  );
+  const missing = !!editing && !q.isPending && !accounts.isPending && !server;
+  useEffect(() => {
+    if (missing && editing) onUnavailable(editing);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [missing, editing?.id]);
+  if (!editing || missing) return null;
+  return (
+    <Dialog open onOpenChange={(v) => !v && onClose()}>
+      <DialogContent className="w-[95vw] sm:w-full sm:max-w-3xl max-h-[90vh] overflow-hidden flex flex-col">
+        {server ? (
+          <DetailContent
+            key={editing.id}
+            editing={editing}
+            server={server}
+            realtimeDcMap={availMap[server.planCode]}
+            availError={availQ.isError}
+            variants={variantIndex[server.planCode]}
+            defaultPrice={defaultPrice}
+            priceLoading={catalogQ.isPending}
+            catalogIdx={catalogIdx}
+            subsidiary={subsidiary}
+            onClose={onClose}
+          />
+        ) : (
+          <>
+            <DialogHeader>
+              <DialogTitle className="font-mono text-xl">{editing.planCode}</DialogTitle>
+              <DialogDescription>{"…"}</DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3 py-2">
+              {Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-14 rounded-xl" />)}
+            </div>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+
+function SpecCard({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
+  return (
+    <div className="border border-border rounded-xl px-3 sm:px-3.5 py-3 flex items-center gap-3 min-w-0">
+      <div className="hidden min-[400px]:flex w-9 h-9 rounded-lg bg-secondary items-center justify-center text-foreground flex-shrink-0">
+        {icon}
+      </div>
+      <div className="min-w-0">
+        <div className="text-[11px] text-muted-foreground">{label}</div>
+        <div className="text-[13px] font-semibold leading-snug line-clamp-2 break-words min-[400px]:truncate" title={value}>{value}</div>
+      </div>
+    </div>
+  );
+}
+
+/** 服务器目录缓存状态徽章：基于 /api/cache/info 显示当前数据是几分钟前的缓存还是已过期 */
+function CacheBadge() {
+  const { t } = useTranslation();
+  // 徽章必须看与列表同一个账户视角的缓存:以前固定看默认账户,
+  // 切到其他账户后刷新的是那个账户的目录,徽章却一直显示默认账户的旧缓存年龄。
+  const accountId = useCatalogAccountId();
+  const info = useCacheInfo(accountId || undefined);
+  const backend = info.data?.backend;
+  if (!backend || !backend.hasCachedData) {
+    return <span className="text-[11px] text-muted-foreground">{t("servers.cache.notLoaded")}</span>;
+  }
+  const ageSec = backend.cacheAge ?? 0;
+  const valid = !!backend.cacheValid;
+
+  let text: string;
+  if (ageSec < 60) {
+    text = t("servers.cache.secondsAgo", { n: ageSec });
+  } else if (ageSec < 3600) {
+    text = t("servers.cache.minutesAgo", { n: Math.floor(ageSec / 60) });
+  } else {
+    const h = Math.floor(ageSec / 3600);
+    const m = Math.floor((ageSec % 3600) / 60);
+    text = m > 0 ? t("servers.cache.hoursMinutesAgo", { h, m }) : t("servers.cache.hoursAgo", { n: h });
+  }
+
+  return (
+    <span
+      className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] border ${
+        valid
+          ? "border-border text-muted-foreground bg-muted/40"
+          : "border-warning/30 text-warning bg-warning/5"
+      }`}
+      title={
+        valid
+          ? t("servers.cache.validTitle")
+          : t("servers.cache.expiredTitle")
+      }
+    >
+      {valid ? t("servers.cache.cached") : t("servers.cache.expired")} · {text}
+    </span>
+  );
+}
+
+/** 商品名 → 系列:"RISE-GAME-1 | AMD Ryzen" → "RISE","KS-LE-6" → "KS";认不出返回空 */
+function seriesOf(name: string): string {
+  const head = (name || "").split("|")[0].trim().toUpperCase();
+  const m = head.match(/^[A-Z]+/);
+  return m ? m[0] : "";
+}
+
+const BUY_PREFS_KEY = "ovh-buy-prefs";
+function loadBuyPrefs(): { retryInterval?: string; duration?: string } {
+  try {
+    const v = JSON.parse(localStorage.getItem(BUY_PREFS_KEY) || "{}");
+    return v && typeof v === "object" ? v : {};
+  } catch {
+    return {};
+  }
+}
+function saveBuyPrefs(p: { retryInterval: string; duration: string }) {
+  try {
+    localStorage.setItem(BUY_PREFS_KEY, JSON.stringify(p));
+  } catch {
+    /* 隐私模式等写不进去时,只是下次不记得 */
+  }
+}

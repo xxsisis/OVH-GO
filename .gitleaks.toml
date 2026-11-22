@@ -1,0 +1,12 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "False positive: i18n translation key in EngagementDialog"
+paths = [
+  '''^web/src/components/server-control/EngagementDialog\.tsx$'''
+]
+regexTarget = "line"
+regexes = [
+  '''i18nKey="[^"]+"'''
+]

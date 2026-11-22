@@ -1,0 +1,141 @@
+package config
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+
+	"github.com/ovh-buy/server/internal/db"
+	"github.com/ovh-buy/server/internal/secret"
+	"github.com/ovh-buy/server/internal/types"
+)
+
+// Store 配置存取（线程安全）
+type Store struct {
+	mu      sync.RWMutex
+	cfg     types.Config
+	db      *db.DB
+	loadErr error
+}
+
+const kvConfigKey = "config"
+
+// secretFields kv['config'] 里需要加密落盘的字段。
+// 这些和 ovh_accounts 表里的凭据是同一级别的东西:Telegram Token 能冒充你发通知、
+// 甚至通过 webhook 触发下单;webhook secret 泄漏则等于 webhook 校验形同虚设。
+// 老用户的 kv['config'] 里还可能残留 OVH 凭据(多账户改造之前的存法),一并处理。
+func encryptConfig(c types.Config) types.Config {
+	c.AppSecret = secret.Encrypt(c.AppSecret)
+	c.ConsumerKey = secret.Encrypt(c.ConsumerKey)
+	c.AppKey = secret.Encrypt(c.AppKey)
+	c.TgToken = secret.Encrypt(c.TgToken)
+	return c
+}
+
+// decryptConfig 出库解密。解不开的字段留空 —— 空 token 会让 Telegram 明确报"未配置",
+// 而乱码会变成 Telegram API 的 401,用户更难定位。
+func decryptConfig(c types.Config) types.Config {
+	dec := func(v string) string {
+		out, err := secret.Decrypt(v)
+		if err != nil {
+			return ""
+		}
+		return out
+	}
+	c.AppKey = dec(c.AppKey)
+	c.AppSecret = dec(c.AppSecret)
+	c.ConsumerKey = dec(c.ConsumerKey)
+	c.TgToken = dec(c.TgToken)
+	return c
+}
+
+// New 从 SQLite kv 表加载配置；不存在则使用默认值
+func New(database *db.DB) *Store {
+	s := &Store{
+		cfg: types.DefaultConfig(),
+		db:  database,
+	}
+	if _, err := s.db.GetKV(kvConfigKey, &s.cfg); err != nil {
+		// 可读取默认值,但不允许用它覆盖未成功加载的原配置。
+		s.cfg = types.DefaultConfig()
+		s.loadErr = err
+	} else {
+		s.cfg = decryptConfig(s.cfg)
+	}
+	// 兜底默认值
+	if s.cfg.Endpoint == "" {
+		s.cfg.Endpoint = "ovh-eu"
+	}
+	if s.cfg.Zone == "" {
+		s.cfg.Zone = "IE"
+	}
+	if s.cfg.IAM == "" {
+		s.cfg.IAM = "go-ovh-" + strings.ToLower(s.cfg.Zone)
+	}
+	// 老配置里没有这两个字段(读出来是 0),补成默认值让 Get() 永远给出明确的数
+	s.cfg.DefaultRetryInterval = types.ClampRetryInterval(s.cfg.DefaultRetryInterval, types.DefaultTaskRetryInterval)
+	s.cfg.QuickOrderRetryInterval = types.ClampRetryInterval(s.cfg.QuickOrderRetryInterval, types.DefaultQuickRetryInterval)
+	return s
+}
+
+// RetryInterval 新建任务的默认重试间隔(秒),已夹到合法区间。
+func (s *Store) RetryInterval() int {
+	s.mu.RLock()
+	v := s.cfg.DefaultRetryInterval
+	s.mu.RUnlock()
+	return types.ClampRetryInterval(v, types.DefaultTaskRetryInterval)
+}
+
+// QuickOrderRetryInterval 监控自动下单的重试间隔(秒),已夹到合法区间。
+func (s *Store) QuickOrderRetryInterval() int {
+	s.mu.RLock()
+	v := s.cfg.QuickOrderRetryInterval
+	s.mu.RUnlock()
+	return types.ClampRetryInterval(v, types.DefaultQuickRetryInterval)
+}
+
+// Get 返回配置的副本（调用方不能修改后影响存储）
+func (s *Store) Get() types.Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg
+}
+
+// Set 覆盖整个配置并落盘
+func (s *Store) Set(c types.Config) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loadErr != nil {
+		return fmt.Errorf("原配置读取失败,禁止覆盖保存,请先恢复数据库并重启: %w", s.loadErr)
+	}
+	if c.IAM == "" {
+		c.IAM = "go-ovh-" + strings.ToLower(c.Zone)
+	}
+	if err := s.db.SetKV(kvConfigKey, encryptConfig(c)); err != nil {
+		return err
+	}
+	s.cfg = c
+	return nil
+}
+
+// HasCredentials 判断是否已配置 OVH 凭据
+func (s *Store) HasCredentials() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg.AppKey != "" && s.cfg.AppSecret != "" && s.cfg.ConsumerKey != ""
+}
+
+// APIBaseURL 根据 endpoint 返回 OVH REST API base URL
+func (s *Store) APIBaseURL() string {
+	s.mu.RLock()
+	ep := s.cfg.Endpoint
+	s.mu.RUnlock()
+	switch ep {
+	case "ovh-us":
+		return "https://api.us.ovhcloud.com"
+	case "ovh-ca":
+		return "https://ca.api.ovh.com"
+	default:
+		return "https://eu.api.ovh.com"
+	}
+}

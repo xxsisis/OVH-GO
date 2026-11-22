@@ -1,0 +1,559 @@
+package monitor
+
+import (
+	"errors"
+	"fmt"
+	"github.com/ovh-buy/server/internal/app"
+	"github.com/ovh-buy/server/internal/orderterm"
+	"sort"
+	"strings"
+	"time"
+)
+
+// autoOrderAccountID:auto_order 触发时用哪个账户下单;空 = 只通知不下单
+// options 为空 = 盯这个 planCode 的全部配置(老行为)。
+// 非空则只盯匹配那套 addon 的配置 —— 见 configMatchesFilter 上的说明。
+func (m *Monitor) AddSubscription(planCode string, datacenters []string, notifyAvailable, notifyUnavailable bool,
+	serverName string, lastStatus map[string]string, history []HistoryEntry, autoOrder bool, quantity int,
+	autoOrderAccountID string, autoPay bool, options []string, duration string) {
+
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	defer m.publishPausedQueueScopesLocked()
+
+	for _, s := range m.subscriptions {
+		// 同 planCode 的不同配置(options)是**不同的订阅** —— 用户抢同型号不同内存
+		// 就是两条。只有 planCode+配置组合都相同才算"已存在",就地更新。
+		if s.PlanCode == planCode && OptionsKey(s.Options) == OptionsKey(options) {
+			m.state.Logger.Warn(fmt.Sprintf("订阅已存在: %s(%s)，将更新配置（不会重置状态，避免重复通知）", planCode, OptionsKey(options)), "monitor")
+			if datacenters == nil {
+				datacenters = []string{}
+			}
+			// 必须持订阅自己的锁改:subsMu 只保护切片,而这条订阅此刻很可能
+			// 正被检查 goroutine 读着(它拿的是同一个指针)。
+			s.mu.Lock()
+			s.revision++
+			s.Datacenters = datacenters
+			s.NotifyAvailable = notifyAvailable
+			s.NotifyUnavailable = notifyUnavailable
+			s.AutoOrder = autoOrder
+			if autoOrder {
+				if quantity < 1 {
+					quantity = 1
+				}
+				s.Quantity = quantity
+			} else {
+				s.Quantity = 0
+			}
+			s.ServerName = serverName
+			s.AutoOrderAccountID = autoOrderAccountID
+			// 自动付款依附于自动下单:不下单就谈不上付款
+			s.AutoPay = autoPay && autoOrder
+			s.Duration = duration
+			// 配置筛选:显式传 nil 和传空切片都当成"盯全部配置"。
+			// 这是就地改配置的路径,options 也要跟着改,否则用户在 TG 上重挑一次配置不生效。
+			if options == nil {
+				options = []string{}
+			}
+			s.Options = options
+			if s.History == nil {
+				s.History = []HistoryEntry{}
+			}
+			s.mu.Unlock()
+			return
+		}
+	}
+
+	if datacenters == nil {
+		datacenters = []string{}
+	}
+	if lastStatus == nil {
+		lastStatus = map[string]string{}
+	}
+	if history == nil {
+		history = []HistoryEntry{}
+	}
+	if options == nil {
+		options = []string{}
+	}
+	sub := &Subscription{
+		PlanCode:           planCode,
+		Datacenters:        datacenters,
+		NotifyAvailable:    notifyAvailable,
+		NotifyUnavailable:  notifyUnavailable,
+		LastStatus:         lastStatus,
+		CreatedAt:          time.Now().Format(time.RFC3339Nano),
+		History:            history,
+		AutoOrderAccountID: autoOrderAccountID,
+		AutoPay:            autoPay && autoOrder,
+		Duration:           duration,
+		Options:            options,
+	}
+	if autoOrder {
+		if quantity < 1 {
+			quantity = 1
+		}
+		sub.AutoOrder = true
+		sub.Quantity = quantity
+	}
+	if serverName != "" {
+		sub.ServerName = serverName
+	}
+	m.subscriptions = append(m.subscriptions, sub)
+	displayName := planCode
+	if serverName != "" {
+		displayName = planCode + " (" + serverName + ")"
+	}
+	dcsStr := "全部"
+	if len(datacenters) > 0 {
+		dcsStr = fmt.Sprintf("%v", datacenters)
+	}
+	m.state.Logger.Info(fmt.Sprintf("添加订阅: %s, 数据中心: %s", displayName, dcsStr), "monitor")
+}
+
+// OptionsKey 把配置筛选规范化成可比较的键(排序后逗号连接;空 = 盯全部配置)。
+// 订阅的身份 = planCode + OptionsKey。
+func OptionsKey(options []string) string {
+	if len(options) == 0 {
+		return ""
+	}
+	c := append([]string(nil), options...)
+	sort.Strings(c)
+	return strings.Join(c, ",")
+}
+
+// HasSubscriptionWithOptions 该 planCode 下是否已存在「另一条」配置组合等于
+// targetKey 的订阅(ownKey = 当前这条自己的组合,相同则不算冲突)。
+func (m *Monitor) HasSubscriptionWithOptions(planCode, targetKey, ownKey string) bool {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	for _, s := range m.subscriptions {
+		if s.PlanCode == planCode && OptionsKey(s.Options) == targetKey && targetKey != ownKey {
+			return true
+		}
+	}
+	return false
+}
+
+var ErrSubscriptionNotFound = errors.New("订阅不存在")
+var ErrSubscriptionConflict = errors.New("已存在同型号同配置的订阅,无法改成重复配置")
+
+// UpdateSubscriptionFields 用原配置键定位,保留暂停状态、历史和库存基准。
+func (m *Monitor) UpdateSubscriptionFields(planCode string, originalKey *string, datacenters []string, notifyAvailable, notifyUnavailable bool,
+	autoOrder bool, quantity int, autoOrderAccountID string, autoPay bool, options []string, duration string) error {
+	var err error
+	duration, err = orderterm.Normalize(duration)
+	if err != nil {
+		return err
+	}
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	defer m.publishPausedQueueScopesLocked()
+	for _, s := range m.subscriptions {
+		if s.PlanCode != planCode || (originalKey != nil && OptionsKey(s.Options) != *originalKey) {
+			continue
+		}
+		for _, other := range m.subscriptions {
+			if other != s && other.PlanCode == planCode && OptionsKey(other.Options) == OptionsKey(options) {
+				return ErrSubscriptionConflict
+			}
+		}
+		s.mu.Lock()
+		s.revision++
+		s.Datacenters = append([]string(nil), datacenters...)
+		s.NotifyAvailable = notifyAvailable
+		s.NotifyUnavailable = notifyUnavailable
+		s.AutoOrder = autoOrder
+		s.Quantity = 0
+		if autoOrder {
+			if quantity < 1 {
+				quantity = 1
+			}
+			s.Quantity = quantity
+		}
+		s.AutoOrderAccountID = autoOrderAccountID
+		s.AutoPay = autoPay && autoOrder
+		s.Duration = duration
+		s.Options = append([]string(nil), options...)
+		s.mu.Unlock()
+		return nil
+	}
+	return ErrSubscriptionNotFound
+}
+
+// queueScopesLocked 生成独立快照,调用方持有 subsMu;all=false 仅取暂停订阅。
+func (m *Monitor) queueScopesLocked(all bool) []app.MonitorQueueScope {
+	scopes := []app.MonitorQueueScope{}
+	for _, sub := range m.subscriptions {
+		cfg := sub.checkConfig()
+		if all || cfg.Paused {
+			scopes = append(scopes, app.MonitorQueueScope{PlanCode: sub.PlanCode, AccountID: cfg.AutoOrderAccountID, Datacenters: cfg.Datacenters, Options: cfg.Options})
+		}
+	}
+	return scopes
+}
+
+// publishPausedQueueScopesLocked 使迟到的本地 quick-order 在入队处也能看到暂停。
+func (m *Monitor) publishPausedQueueScopesLocked() {
+	m.state.SetPausedMonitorScopes(m.queueScopesLocked(false))
+	if m.state.OrderPrewarm != nil {
+		go m.syncPrewarm()
+	}
+}
+
+// HeldTasks 恢复订阅后,列出这条订阅当初连带暂停、现在可以一键恢复的任务。
+// 全局手动停止时所有订阅范围都视为仍暂停,不提供恢复入口。
+func (m *Monitor) HeldTasks(planCode string, optionsKey *string) []string {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	if m.state.MonitorStopped() {
+		return []string{}
+	}
+	for _, sub := range m.subscriptions {
+		if sub.PlanCode != planCode || (optionsKey != nil && OptionsKey(sub.Options) != *optionsKey) {
+			continue
+		}
+		cfg := sub.checkConfig()
+		if cfg.Paused {
+			return []string{}
+		}
+		scope := app.MonitorQueueScope{PlanCode: planCode, AccountID: cfg.AutoOrderAccountID, Datacenters: cfg.Datacenters, Options: cfg.Options}
+		return m.state.HeldMonitorTasks(scope, m.queueScopesLocked(false))
+	}
+	return []string{}
+}
+
+// SetPaused 暂停时联动关联队列;恢复只恢复监控,不自动继续扣款任务。
+// nil 定位第一条;指向空串则精确定位全部配置订阅。
+func (m *Monitor) SetPaused(planCode string, optionsKey *string, paused bool) (int, error) {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	for _, sub := range m.subscriptions {
+		if sub.PlanCode != planCode || (optionsKey != nil && OptionsKey(sub.Options) != *optionsKey) {
+			continue
+		}
+		sub.mu.Lock()
+		sub.revision++
+		sub.Paused = paused
+		sub.mu.Unlock()
+		// 先封住新自动任务,再暂停队列;封闸前已经入队的任务也会被下面覆盖。
+		m.publishPausedQueueScopesLocked()
+		if !paused {
+			return 0, nil
+		}
+		cfg := sub.checkConfig()
+		return m.state.PauseMonitorQueues([]app.MonitorQueueScope{{PlanCode: planCode, AccountID: cfg.AutoOrderAccountID, Datacenters: cfg.Datacenters, Options: cfg.Options}})
+	}
+	return 0, ErrSubscriptionNotFound
+}
+
+// RemoveSubscriptionExact 按 planCode+配置组合精确删除(卡片级删除);
+// optionsKey 传空串 = 删除该 planCode 的第一条(兼容 TG 等按型号的老入口)。
+func (m *Monitor) RemoveSubscriptionExact(planCode, optionsKey string) bool {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	defer m.publishPausedQueueScopesLocked()
+	original := len(m.subscriptions)
+	kept := make([]*Subscription, 0, len(m.subscriptions))
+	removed := false
+	for _, s := range m.subscriptions {
+		if !removed && s.PlanCode == planCode && (optionsKey == "" || OptionsKey(s.Options) == optionsKey) {
+			removed = true
+			continue
+		}
+		kept = append(kept, s)
+	}
+	if removed {
+		m.subscriptions = kept
+		m.state.Logger.Info(fmt.Sprintf("已移除订阅: %s(%s)", planCode, optionsKey), "monitor")
+	}
+	return len(m.subscriptions) < original
+}
+
+func (m *Monitor) RemoveSubscription(planCode string) bool {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	defer m.publishPausedQueueScopesLocked()
+	original := len(m.subscriptions)
+	kept := make([]*Subscription, 0, len(m.subscriptions))
+	for _, s := range m.subscriptions {
+		if s.PlanCode != planCode {
+			kept = append(kept, s)
+		}
+	}
+	m.subscriptions = kept
+	if len(m.subscriptions) < original {
+		m.state.Logger.Info("删除订阅: "+planCode, "monitor")
+		return true
+	}
+	return false
+}
+
+func (m *Monitor) ClearSubscriptions() int {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	defer m.publishPausedQueueScopesLocked()
+	count := len(m.subscriptions)
+	m.subscriptions = []*Subscription{}
+	m.state.Logger.Info(fmt.Sprintf("清空所有订阅 (%d 项)", count), "monitor")
+	return count
+}
+
+// FindSubscription 按 planCode 查找,返回的是**深拷贝**(与 Snapshot 同口径)。
+// 不返回真身:调用方(handler 读 History、SubscriptionAsJSON 做 Marshal)都在 HTTP goroutine 里,
+// 而检查 goroutine 正并发地往同一条订阅上 append History —— 直接把指针递出去就是数据竞争。
+// 需要改订阅请走 AddSubscription / RemoveSubscription。
+func (m *Monitor) FindSubscription(planCode string, optionsKey ...string) *Subscription {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	for _, s := range m.subscriptions {
+		if s.PlanCode == planCode && (len(optionsKey) == 0 || OptionsKey(s.Options) == optionsKey[0]) {
+			return s.snapshot()
+		}
+	}
+	return nil
+}
+
+// SetKnownServers 用于从持久化恢复
+// SetSubscriptionOptions 只改一条订阅盯哪套配置,其余字段原样不动。
+// 返回 false = 没有这条订阅。
+//
+// 为什么不复用 AddSubscription:它是 upsert,调用方得把所有字段重新凑齐,
+// 漏一个就等于把用户的设置改掉(自动下单账户、数量、autoPay 都在里面)。
+// 而且这里只动 Options,不碰 LastStatus / History —— 状态一清,
+// 下一轮就会把"本来就有货"当成补货跳变,发一条根本没发生的通知外加真下单。
+func (m *Monitor) SetSubscriptionOptions(planCode string, options []string) bool {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	for _, sub := range m.subscriptions {
+		if sub.PlanCode != planCode {
+			continue
+		}
+		opts := make([]string, len(options))
+		copy(opts, options)
+		sub.mu.Lock()
+		sub.Options = opts
+		sub.mu.Unlock()
+		return true
+	}
+	return false
+}
+
+func (m *Monitor) SetKnownServers(set map[string]struct{}) {
+	m.subsMu.Lock()
+	m.knownServers = set
+	m.subsMu.Unlock()
+}
+
+// KnownServers 返回当前已知服务器集合（用于持久化）
+func (m *Monitor) KnownServers() []string {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	out := make([]string, 0, len(m.knownServers))
+	for k := range m.knownServers {
+		out = append(out, k)
+	}
+	return out
+}
+
+// MessageUUIDCacheLookup 用于 webhook 回调时取回完整配置
+// MessageUUIDCacheDelete 消费一条内存缓存(一键下单按钮的内存回退路径:
+// 命中后必须删,不然回退路径绕过 DB 的一次性 nonce)
+func (m *Monitor) MessageUUIDCacheDelete(id string) {
+	m.cacheLock.Lock()
+	delete(m.messageUUIDCache, id)
+	m.cacheLock.Unlock()
+}
+
+func (m *Monitor) MessageUUIDCacheLookup(id string) *CachedMessage {
+	m.cacheLock.Lock()
+	defer m.cacheLock.Unlock()
+	if cm, ok := m.messageUUIDCache[id]; ok {
+		if time.Now().Unix()-int64(cm.Timestamp) < int64(m.messageUUIDCacheTTL.Seconds()) {
+			return cm
+		}
+		delete(m.messageUUIDCache, id)
+		m.state.Logger.Warn("UUID缓存已过期: "+id, "telegram")
+	}
+	return nil
+}
+
+// OptionsCacheLookup 兼容旧机制
+func (m *Monitor) OptionsCacheLookup(key string) []string {
+	m.cacheLock.Lock()
+	defer m.cacheLock.Unlock()
+	if c, ok := m.optionsCache[key]; ok {
+		if time.Now().Unix()-int64(c.Timestamp) < int64(m.optionsCacheTTL.Seconds()) {
+			return c.Options
+		}
+		delete(m.optionsCache, key)
+		m.state.Logger.Warn("options缓存已过期: "+key, "telegram")
+	}
+	return nil
+}
+
+func (m *Monitor) cleanupExpiredCaches() {
+	now := time.Now().Unix()
+	// 顺带清理 SQLite 里过期的一键下单按钮，防止表无限增长
+	if m.state.DB != nil {
+		before := float64(time.Now().Add(-m.messageUUIDCacheTTL).Unix())
+		if n, err := m.state.DB.DeleteExpiredTelegramButtons(before); err != nil {
+			m.state.Logger.Debug("清理过期一键下单按钮失败: "+err.Error(), "telegram")
+		} else if n > 0 {
+			m.state.Logger.Debug(fmt.Sprintf("已清理 %d 个过期一键下单按钮", n), "telegram")
+		}
+	}
+	m.cacheLock.Lock()
+	defer m.cacheLock.Unlock()
+	expUUIDs := []string{}
+	for k, v := range m.messageUUIDCache {
+		if now-int64(v.Timestamp) >= int64(m.messageUUIDCacheTTL.Seconds()) {
+			expUUIDs = append(expUUIDs, k)
+		}
+	}
+	for _, k := range expUUIDs {
+		delete(m.messageUUIDCache, k)
+	}
+	expOpts := []string{}
+	for k, v := range m.optionsCache {
+		if now-int64(v.Timestamp) >= int64(m.optionsCacheTTL.Seconds()) {
+			expOpts = append(expOpts, k)
+		}
+	}
+	for _, k := range expOpts {
+		delete(m.optionsCache, k)
+	}
+	// 顺带扫掉 resolveQueryAccount 的过期条目:它的 key 里带账户指纹,
+	// 每改一次账户就换一批 key,旧 key 再也不会被读到 —— 不清就是只涨不降的内存。
+	queryAccountMu.Lock()
+	expChoices := 0
+	for k, c := range queryAccountCache {
+		if time.Since(c.at) >= c.effectiveTTL() {
+			delete(queryAccountCache, k)
+			expChoices++
+		}
+	}
+	queryAccountMu.Unlock()
+	if expChoices > 0 {
+		m.state.Logger.Debug(fmt.Sprintf("清理过期查询账户选取缓存: %d 条", expChoices), "monitor")
+	}
+	if len(expUUIDs) > 0 || len(expOpts) > 0 {
+		m.state.Logger.Debug(fmt.Sprintf("清理过期缓存: UUID=%d个, Options=%d个", len(expUUIDs), len(expOpts)), "monitor")
+	}
+}
+
+// AddMessageUUID 缓存按钮对应的配置
+func (m *Monitor) AddMessageUUID(id, planCode, datacenter string, options []string, configInfo map[string]interface{}) {
+	now := float64(time.Now().Unix())
+	m.cacheLock.Lock()
+	m.messageUUIDCache[id] = &CachedMessage{
+		PlanCode:   planCode,
+		Datacenter: datacenter,
+		Options:    options,
+		ConfigInfo: configInfo,
+		Timestamp:  now,
+	}
+	m.cacheLock.Unlock()
+
+	// 同时落库：内存缓存进程重启就没了，按钮一点击就 400；
+	// 落库后按钮跨重启可用，并且 used_at 让它只能被消费一次。
+	if m.state.DB != nil {
+		if err := m.state.DB.UpsertTelegramButton(id, planCode, datacenter, options, configInfo, now); err != nil {
+			m.state.Logger.Warn("一键下单按钮落库失败（仍可用内存缓存）: "+err.Error(), "telegram")
+		}
+	}
+}
+
+// SubscriptionConfig 取一份订阅配置的只读快照。
+// 为什么不直接把 *Subscription 交出去让调用方读字段:那些字段被检查 goroutine
+// 并发改着,裸读是数据竞争。这里在订阅自己的锁里拷一份出去。
+// 只拷配置字段 —— LastStatus / History 是状态,编辑接口不该碰。
+func (m *Monitor) SubscriptionConfig(planCode string, optionsKey ...string) SubscriptionConfig {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	for _, s := range m.subscriptions {
+		if s.PlanCode != planCode || (len(optionsKey) > 0 && OptionsKey(s.Options) != optionsKey[0]) {
+			continue
+		}
+		s.mu.Lock()
+		cfg := SubscriptionConfig{
+			PlanCode:           s.PlanCode,
+			Datacenters:        append([]string(nil), s.Datacenters...),
+			NotifyAvailable:    s.NotifyAvailable,
+			NotifyUnavailable:  s.NotifyUnavailable,
+			ServerName:         s.ServerName,
+			AutoOrder:          s.AutoOrder,
+			Quantity:           s.Quantity,
+			AutoOrderAccountID: s.AutoOrderAccountID,
+			AutoPay:            s.AutoPay,
+			Duration:           s.Duration,
+			Options:            append([]string(nil), s.Options...),
+		}
+		s.mu.Unlock()
+		return cfg
+	}
+	return SubscriptionConfig{}
+}
+
+// SubscriptionConfig 订阅里「用户可改的那部分」
+type SubscriptionConfig struct {
+	Duration           string
+	PlanCode           string
+	Datacenters        []string
+	NotifyAvailable    bool
+	NotifyUnavailable  bool
+	ServerName         string
+	AutoOrder          bool
+	Quantity           int
+	AutoOrderAccountID string
+	AutoPay            bool
+	// Options 只盯这套配置。空 = 全部配置。
+	Options []string
+}
+
+// ClearAccountRefs 把内存订阅里对某账户的引用清掉。
+//
+// 删账户时 SQL 已经把 auto_order_account_id 清空,但 Monitor 内存里还是旧值 ——
+// 而 SaveToDB 是拿内存整表 Replace 回写的,任何一次订阅增删改都会把已删的
+// 账户 ID 复活回数据库,SQL 的级联清理等于白做。所以内存必须同步清。
+// 返回清了几条,给日志用。
+func (m *Monitor) ClearAccountRefs(accountID string) int {
+	if accountID == "" {
+		return 0
+	}
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	n := 0
+	for _, s := range m.subscriptions {
+		s.mu.Lock()
+		if s.AutoOrderAccountID == accountID {
+			s.AutoOrderAccountID = ""
+			// 账户没了就不可能下单,别让 AutoOrder 停留在"开着但买不了"的假状态
+			s.AutoOrder = false
+			n++
+		}
+		s.mu.Unlock()
+	}
+	return n
+}
+
+// DisableAutoOrderForAccount 关掉指定账户全部订阅的自动下单(带锁,持久化)。
+// 给 proxyguard 用:以前它绕过内存态直接改库,监控循环轮末的整表落库
+// 会用内存里的 AutoOrder=true 覆盖回去 —— 代理挂了但自动下单照常触发
+func (m *Monitor) DisableAutoOrderForAccount(accountID string) int {
+	m.subsMu.Lock()
+	n := 0
+	for _, sub := range m.subscriptions {
+		if sub.AutoOrderAccountID == accountID && sub.AutoOrder {
+			sub.mu.Lock()
+			sub.AutoOrder = false
+			sub.mu.Unlock()
+			n++
+		}
+	}
+	m.subsMu.Unlock()
+	if n > 0 {
+		m.SaveToDB()
+	}
+	return n
+}

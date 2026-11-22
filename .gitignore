@@ -1,0 +1,126 @@
+# ============================================================
+# OVH 控制台 —— .gitignore
+#
+# 这个项目会把 OVH API 凭据、Telegram Bot Token 明文存进 SQLite,
+# .env 里还有前后端通信密钥。第一段是**绝对不能进仓库**的东西,
+# 改之前先想清楚:凭据一旦推上去,删 commit 是没用的 ——
+# 必须去 OVH 控制台吊销 AppKey/ConsumerKey 并重发 Telegram Token。
+# ============================================================
+
+# ---------- 一、机密：泄漏 = 账户失守 ----------
+# 后端密钥(API_SECRET_KEY 等)。只放行 *.env.example 样板
+.env
+.api-secret
+.env.*
+*.env
+!.env.example
+!*.env.example
+
+# SQLite 数据库:ovh_accounts 表明文存 AppKey / AppSecret / ConsumerKey,
+# kv 表存 Telegram Token / Chat ID / webhook secret
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# 运行数据目录(DATA_DIR / CACHE_DIR / LOGS_DIR,默认落在 server/ 下)
+data/
+server/data/
+server/cache/
+server/logs/
+cache/
+logs/
+
+# 日志(会记录 OVH 原始报错、服务名、IP、订单号)
+*.log
+*.log.json
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------- 二、本地脚本：不入库 ----------
+# 本地协作说明,保留在电脑上,不提交到 GitHub
+/CLAUDE.md
+# 打包/发布脚本是各人本机的活,不进仓库(仓库从 v0.0.1 起就是这个约定)
+build.sh
+build.ps1
+
+# ---------- 三、构建产物 ----------
+/dist/
+dist/
+/build/
+ovh-server
+ovh-server-*
+*.exe
+*.exe~
+server/main
+server/main.exe
+server/server
+server/server.exe
+
+# Vite 构建产物。`-tags ui` 靠 //go:embed 把它塞进二进制,
+# 但它是 `cd web && npm run build` 生成的,不必入库
+server/web/
+
+# Go
+*.test
+*.out
+coverage.*
+__debug_bin*
+server/vendor/
+
+# 前端
+/node_modules/
+node_modules/
+web/node_modules/
+web/dist/
+web/dist-ssr/
+web/.next/
+/.next/
+web/.tanstack/
+*.tsbuildinfo
+web/*.tsbuildinfo
+# TanStack Router 自动生成
+web/src/routeTree.gen.ts
+
+# ---------- 四、本地环境噪音 ----------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.swp
+*.swo
+*~
+
+# 备份 / 临时
+*.bak
+*.orig
+*.tmp
+backup-*/
+
+# Expo App(构建产物;packages/core 源码要提交)
+app/node_modules/
+app/.expo/
+app/package-lock.json
+
+# Swift iOS app(SPM 构建产物)
+app/OvhConsole/.build/
+app/OvhConsole/.swiftpm/
+
+# Xcode
+app/OvhConsole/DerivedData/
+app/OvhConsole/**/xcuserdata/
+
+# 本地开发用,不上传(kl 2026-10-05):错误码生成脚本与 iOS App 源码
+/tools/
+/app/
+/packages/

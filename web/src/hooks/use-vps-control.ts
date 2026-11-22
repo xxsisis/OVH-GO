@@ -1,0 +1,696 @@
+import { useAccountScope } from "@/hooks/use-account";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useAccountApi } from "@/hooks/use-account-api";
+import { qk, accountQueryKey } from "@/lib/query";
+import type { PartialList } from "./partial-list";
+
+/* ────────────── 类型定义 ────────────── */
+
+export interface OwnedVps {
+  serviceName: string;
+  name: string;
+  displayName: string;
+  state: string;        // "running" / "stopped" / "migrating" / "installing"
+  cluster: string;
+  zone: string;
+  keymap: string;
+  netbootMode: string;
+  offerType: string;
+  slaMonitoring: boolean | null;
+  lockStatus: string;
+  model: string;        // vps.Model.name
+  vcore: number;
+  memoryMB: number;
+  diskGB: number;
+  /** billing status。serviceInfos 拉取失败时为 null —— 「没查到」不是一种状态，别渲染成「unknown」 */
+  status: string | null;
+  /** 是否自动续费。null = 这次没查到（serviceInfos 失败或 renew 为空），必须和 false（确实没开）分开显示 */
+  renewalType: boolean | null;
+  error?: string;
+}
+
+export interface VpsServiceInfo {
+  status: string;
+  expiration: string;
+  creation: string;
+  renewalType: boolean;
+  renewalPeriod: number;
+  renewalDeleteAtExpiration: boolean;
+  renewalForced: boolean;
+  renewalManualPayment: boolean;
+  /** 仅由该服务的续费能力判断,不能按账户地区推断。 */
+  renewalManualUnsupported?: boolean;
+  /** GET /services/{id} 的 billing.renew.capacities.mode;未取得时保持未知。 */
+  renewalModes?: string[];
+  possibleRenewPeriod: number[];
+  /** 终止状态权威来源(lifecycle.pendingActions);读不到时后端不下发 */
+  terminationScheduled?: boolean;
+  /** 哪种终止(立即 / 到期 / 合同期结束),见独服侧同名字段说明 */
+  terminationAction?: string;
+  /** 读 lifecycle 失败,状态未经验证 */
+  terminationStateUnknown?: boolean;
+  terminationDate?: string;
+}
+
+export interface VpsIp {
+  ipAddress: string;
+  reverse?: string;
+  type?: string;
+  version?: string;
+  gateway?: string;
+  geolocation?: string;
+  macAddress?: string;
+}
+
+export interface VpsTemplate {
+  /** EU 返回 long, US 返回 string —— 直接当 ID 回传给 reinstall 接口即可 */
+  id: number | string;
+  name: string;
+  distribution: string;
+  bitFormat: number;
+  locale: string;
+  availableLanguage: string[];
+}
+
+/** templates 接口返回的 kind:
+ *   "templateId" - EU,reinstall body 用 templateId (long)
+ *   "imageId"    - US,rebuild body 用 imageId (string),前端只展示用,后端按 endpoint 自动分路 */
+export type TemplateKind = "templateId" | "imageId";
+
+export interface VpsTask {
+  id: number;
+  type: string;
+  state: string;       // todo / doing / done / cancelled / paused
+  date: string;
+  progress: number;
+}
+
+export interface VpsSnapshot {
+  id: string;
+  creationDate: string;
+  description: string;
+  region: string;
+}
+
+/* ────────────── List + Info + Status ────────────── */
+
+export function useOwnedVps() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: qk.vpsControl.list(accountId),
+    queryFn: async () => {
+      const res = await api.get("/vps-control/list");
+      return (res.data?.vps || []) as OwnedVps[];
+    },
+    staleTime: 60_000,
+  });
+}
+
+export function useVpsInfo(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.info(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/info`);
+      return res.data?.info as Record<string, any> | null;
+    },
+    enabled: !!svc,
+  });
+}
+
+/* (useVpsServiceStatus / VpsServiceStatusResult 已删:/vps/{sn}/status 被 OVH 废弃,
+   无替代端点 —— 见 vps-control.tsx 里同名面板的删除说明。) */
+
+export function useVpsServiceInfo(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.serviceInfo(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/serviceinfo`);
+      return (res.data?.serviceInfo || null) as VpsServiceInfo | null;
+    },
+    enabled: !!svc,
+  });
+}
+
+export function useUpdateVpsRenewal(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { mode: "auto" | "manual" | "delete"; period?: number }) => {
+      const res = await api.put(`/vps-control/${svc}/serviceinfo/renewal`, vars);
+      return res.data;
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.serviceInfo(svc), accountId) }),
+  });
+}
+
+export function useVpsIps(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.ips(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/ips`);
+      return (res.data?.ips || []) as VpsIp[];
+    },
+    enabled: !!svc,
+  });
+}
+
+export function useSetVpsIpReverse(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { ip: string; reverse: string }) => {
+      const res = await api.put(`/vps-control/${svc}/ips/${vars.ip}/reverse`, { reverse: vars.reverse });
+      return res.data;
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.ips(svc), accountId) }),
+  });
+}
+
+export function useVpsDatacenter(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.datacenter(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/datacenter`);
+      return res.data?.datacenter as { name: string; longName: string; country: string } | null;
+    },
+    enabled: !!svc,
+  });
+}
+
+// VPS CPU/内存监控端点已被 OVH 全面 DEPRECATED:
+//   /vps/{name}/monitoring  - DEPRECATED 2024-07,计划 2024-09 删除
+//   /vps/{name}/statistics  - DEPRECATED 2023-11,计划 2024-01 删除
+// OVH 没有提供新的 VPS 级 CPU/内存监控端点,只剩磁盘监控(/disks/{id}/use)。
+// 移除监控功能,需要看负载请登录 VPS 用 top/htop。
+
+/* ────────────── Power ────────────── */
+
+export function useVpsStart(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () => (await api.post(`/vps-control/${svc}/start`)).data,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["vps-control", "list"] });
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.info(svc), accountId) });
+    },
+  });
+}
+
+export function useVpsStop(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () => (await api.post(`/vps-control/${svc}/stop`)).data,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["vps-control", "list"] });
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.info(svc), accountId) });
+    },
+  });
+}
+
+export function useVpsReboot(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useMutation({
+    mutationFn: async () => (await api.post(`/vps-control/${svc}/reboot`)).data,
+  });
+}
+
+export function useVpsConsoleUrl(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useMutation({
+    mutationFn: async () => {
+      const res = await api.post(`/vps-control/${svc}/console`);
+      return res.data?.url as string;
+    },
+  });
+}
+
+/* (useVpsSetPassword 已删:/vps/{sn}/setPassword 被 OVH 废弃,无替代端点;
+   新做法 = 重装时让 OVH 重发密码,或预装 SSH key。) */
+
+/* ────────────── Reinstall ────────────── */
+
+/** 当前安装的系统信息(/vps/{sn}/images/current;旧 /distribution 已废弃停用) */
+export function useVpsCurrentOS(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.currentOS(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/current-os`);
+      return res.data?.currentOS as {
+        id: number | string;
+        name: string;
+        distribution: string;
+        bitFormat: number;
+        locale: string;
+        source: string;
+      } | null;
+    },
+    enabled: !!svc,
+    staleTime: 5 * 60_000,
+  });
+}
+
+/** 模板列表 + 部分失败信息。kind 决定 reinstall 用 templateId 还是 imageId（后端按 endpoint 自动分路） */
+export interface VpsTemplateList extends PartialList<VpsTemplate> {
+  kind: TemplateKind | "";
+}
+
+/**
+ * 系统模板列表。
+ * 后端现在区分「详情全挂」和「账户真没模板」：全挂返 500（这里直接抛出去让 isError 生效），
+ * 部分挂返 200 + partial/failed。组件必须把 isError 渲染成「读取失败，请重试」，
+ * 而不是沿用「暂无可用模板」那句空态文案 —— 那会让用户以为账户没模板从而放弃重试。
+ */
+export function useVpsTemplates(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.templates(svc || ""), accountId),
+    queryFn: async (): Promise<VpsTemplateList> => {
+      const res = await api.get(`/vps-control/${svc}/templates`);
+      const failedCount = Number(res.data?.failed) || 0;
+      return {
+        items: (res.data?.templates || []) as VpsTemplate[],
+        kind: (res.data?.kind || "") as TemplateKind | "",
+        partial: res.data?.partial === true || failedCount > 0,
+        failedCount,
+      };
+    },
+    enabled: !!svc,
+    staleTime: 5 * 60_000,
+  });
+}
+
+export function useReinstallVps(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    // 全量走 /vps/{sn}/rebuild(body vps.rebuild.post):imageId + 单个 sshKey +
+    // doNotSendPassword。旧 reinstall 的 language/softwareId 字段 rebuild 不收,
+    // 别再让调用方以为选了语言会生效。
+    mutationFn: async (vars: {
+      templateId: number | string; // 语义是 imageId;数字是旧缓存,后端转字符串
+      sshKey?: string[];
+      doNotSendPassword?: boolean;
+    }) => (await api.post(`/vps-control/${svc}/reinstall`, vars)).data,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.tasks(svc), accountId) });
+    },
+  });
+}
+
+/* ────────────── Tasks ────────────── */
+
+export function useVpsTasks(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.tasks(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/tasks`);
+      return (res.data?.tasks || []) as VpsTask[];
+    },
+    enabled: !!svc,
+  });
+}
+
+export function useVpsTask(svc: string | null, taskId: number | string | null, refetchInterval = 0) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.task(svc || "", taskId || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/tasks/${taskId}`);
+      return res.data?.task as VpsTask | null;
+    },
+    enabled: !!svc && !!taskId,
+    refetchInterval,
+  });
+}
+
+/* ────────────── Snapshot ────────────── */
+
+export function useVpsSnapshot(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.snapshot(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/snapshot`);
+      return res.data?.snapshot as VpsSnapshot | null;
+    },
+    enabled: !!svc,
+  });
+}
+
+export function useCreateVpsSnapshot(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { description?: string }) => (await api.post(`/vps-control/${svc}/snapshot`, vars)).data,
+    onSuccess: () => qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.snapshot(svc), accountId) }),
+  });
+}
+
+export function useUpdateVpsSnapshot(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { description: string }) => (await api.put(`/vps-control/${svc}/snapshot`, vars)).data,
+    onSuccess: () => qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.snapshot(svc), accountId) }),
+  });
+}
+
+export function useRevertVpsSnapshot(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () => (await api.post(`/vps-control/${svc}/snapshot/revert`)).data,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["vps-control", "list"] });
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.tasks(svc), accountId) });
+    },
+  });
+}
+
+export function useDeleteVpsSnapshot(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () => (await api.delete(`/vps-control/${svc}/snapshot`)).data,
+    onSuccess: () => qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.snapshot(svc), accountId) }),
+  });
+}
+
+/* ────────────── Misc ────────────── */
+
+export function useChangeVpsContact() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useMutation({
+    mutationFn: async (vars: { serviceName: string; admin?: string; tech?: string; billing?: string }) => {
+      const body: Record<string, string> = {};
+      if (vars.admin) body.contactAdmin = vars.admin;
+      if (vars.tech) body.contactTech = vars.tech;
+      if (vars.billing) body.contactBilling = vars.billing;
+      return (await api.post(`/vps-control/${vars.serviceName}/change-contact`, body)).data;
+    },
+  });
+}
+
+/**
+ * VPS 的到期终止策略。和独服同理：**不要**用 /terminate（那是立即终止）。
+ * 到期终止只能通过 PUT /services/{serviceId} 的 terminationPolicy 设置。
+ */
+export function useUpdateVpsTerminationPolicy() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { serviceName: string; policy: string }) =>
+      (await api.put(`/vps-control/${vars.serviceName}/termination-policy`, {
+        policy: vars.policy,
+      })).data,
+    onSuccess: (_d, vars) => {
+      // 终止策略横幅读 serviceInfo,不失效会一直显示旧政策
+      qc.invalidateQueries({ queryKey: ["vps-control", "serviceInfo", vars.serviceName] });
+    },
+  });
+}
+
+/**
+ * ⚠️ 立即终止 —— 提交并确认后 OVH 会**当场暂停** VPS，
+ * 并邮件通知「5 天内不付款就彻底清除硬盘数据」。
+ * 想要「到期才终止」请用 useUpdateVpsTerminationPolicy，不要用这个。
+ * 目前界面上没有入口，保留仅为将来做「立即终止」时复用。
+ */
+export function useTerminateVps() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useMutation({
+    mutationFn: async (vars: { serviceName: string }) =>
+      (await api.post(`/vps-control/${vars.serviceName}/terminate`)).data,
+  });
+}
+
+export function useConfirmTerminateVps() {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useMutation({
+    mutationFn: async (vars: { serviceName: string; token: string; reason?: string; commentary?: string }) =>
+      (await api.post(`/vps-control/${vars.serviceName}/confirm-termination`, {
+        token: vars.token,
+        reason: vars.reason,
+        commentary: vars.commentary,
+      })).data,
+  });
+}
+
+export function useVpsSecondaryDns(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.secondaryDns(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/secondary-dns`);
+      return (res.data?.domains || []) as any[];
+    },
+    enabled: !!svc,
+  });
+}
+
+export function useAddVpsSecondaryDns(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { domain: string; ip: string }) =>
+      (await api.post(`/vps-control/${svc}/secondary-dns`, vars)).data,
+    onSuccess: () => qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.secondaryDns(svc), accountId) }),
+  });
+}
+
+export function useDeleteVpsSecondaryDns(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (domain: string) =>
+      (await api.delete(`/vps-control/${svc}/secondary-dns/${domain}`)).data,
+    onSuccess: () => qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.secondaryDns(svc), accountId) }),
+  });
+}
+
+/**
+ * VPS 附加选项(ftpbackup / veeam / snapshot / automatedBackup / windows / cpanel / plesk / additionalDisk)。
+ *
+ * manageEndpointsAvailable=false 表示"这个选项在当前账户所在区域没有专属管理端点":
+ * 美区 OVHcloud 的 /vps/{sn}/backupftp 与 /vps/{sn}/veeam 整套端点都不存在(EU/CA 才有),
+ * 但 /vps/{sn}/option 照样把它们列出来(三区的 VpsOptionEnum 完全一致)。
+ * 前端必须据此把「管理」入口置灰并显示 unsupportedReason,而不是让用户点进去吃一串 404。
+ *
+ * 注意:它只说"没有管理端点",不代表选项没生效、也不影响退订 ——
+ * DELETE /vps/{sn}/option/{option} 三区都注册,所以别拿它去禁用「取消选项」。
+ */
+export interface VpsOption {
+  option: string;
+  state?: string;
+  /** false = 该选项在本区没有专属管理端点(后端 handlers/vps_control_misc.go 打的标记) */
+  manageEndpointsAvailable?: boolean;
+  /** manageEndpointsAvailable=false 时的中文原因 */
+  unsupportedReason?: string;
+  /** 打标记时后端带回的大区,目前只会是 "US" */
+  region?: string;
+  [k: string]: any;
+}
+
+export function useVpsOptions(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.options(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/options`);
+      return (res.data?.options || []) as VpsOption[];
+    },
+    enabled: !!svc,
+  });
+}
+
+/* (useDeleteVpsOption 已删:DELETE /vps/{sn}/option/{option} 已从三区 schema 消失,
+   取消选项只能到 OVH 控制台。它本来就没有 UI 调用方。) */
+
+/* ────────────── Engagement(合同期) ────────────── */
+
+export function useVpsEngagement(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.engagement(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/engagement`);
+      return res.data?.engagement as { currentPeriod?: any; endRule?: any } | null;
+    },
+    enabled: !!svc,
+  });
+}
+
+export function useVpsEngagementAvailable(svc: string | null, enabled = true) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.engagementAvailable(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/engagement/available`);
+      return (res.data?.pricings || []) as any[];
+    },
+    enabled: !!svc && enabled,
+  });
+}
+
+export function useVpsEngagementRequest(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.engagementRequest(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/engagement/request`);
+      return res.data?.request as any | null;
+    },
+    enabled: !!svc,
+  });
+}
+
+export function useCreateVpsEngagementRequest(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { pricingMode: string }) =>
+      (await api.post(`/vps-control/${svc}/engagement/request`, vars)).data,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.engagement(svc), accountId) });
+      qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.engagementRequest(svc), accountId) });
+    },
+  });
+}
+
+export function useDeleteVpsEngagementRequest(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () =>
+      (await api.delete(`/vps-control/${svc}/engagement/request`)).data,
+    onSuccess: () => qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.engagementRequest(svc), accountId) }),
+  });
+}
+
+export function useUpdateVpsEngagementEndRule(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { strategy: string }) =>
+      (await api.put(`/vps-control/${svc}/engagement/end-rule`, vars)).data,
+    onSuccess: () => qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.engagement(svc), accountId) }),
+  });
+}
+
+/* ────────────── DDoS Mitigation ────────────── */
+
+export interface VpsMitigationIp {
+  ipOnMitigation: string;
+  state: string;
+  auto: boolean;
+  permanent: boolean;
+}
+
+export interface VpsMitigationBlock {
+  /** OVH 认的带掩码 ipBlock，后端保证以本行的 ipAddress 开头（归一化失败时就是裸 IP） */
+  ipBlock: string;
+  /** 裸 IP。要显示地址就直接用它，别再从 ipBlock 上 split("/") 反推 */
+  ipAddress?: string;
+  mitigations: VpsMitigationIp[];
+  error?: string;
+}
+
+export function useVpsMitigation(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.mitigation(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/mitigation`);
+      return (res.data?.ips || []) as VpsMitigationBlock[];
+    },
+    enabled: !!svc,
+    // 有过渡态(creationPending/removalPending)时每 5 秒轮询一次,稳定就停
+    refetchInterval: (q) => {
+      const data = q.state.data as VpsMitigationBlock[] | undefined;
+      if (!data) return false;
+      const hasTransition = data.some((b) =>
+        b.mitigations.some((m) => m.state === "creationPending" || m.state === "removalPending"),
+      );
+      return hasTransition ? 5000 : false;
+    },
+  });
+}
+
+export function useEnableVpsMitigation(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { ip: string; block: string }) =>
+      (await api.post(`/vps-control/${svc}/mitigation/${vars.ip}?block=${encodeURIComponent(vars.block)}`)).data,
+    onSuccess: () => qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.mitigation(svc), accountId) }),
+  });
+}
+
+export function useDisableVpsMitigation(svc: string) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { ip: string; block: string }) =>
+      (await api.delete(`/vps-control/${svc}/mitigation/${vars.ip}?block=${encodeURIComponent(vars.block)}`)).data,
+    onSuccess: () => qc.invalidateQueries({ queryKey: accountQueryKey(qk.vpsControl.mitigation(svc), accountId) }),
+  });
+}
+
+export function useVpsAutomatedBackup(svc: string | null) {
+  const accountId = useAccountScope();
+  const api = useAccountApi(accountId);
+  return useQuery({
+    queryKey: accountQueryKey(qk.vpsControl.automatedBackup(svc || ""), accountId),
+    queryFn: async () => {
+      const res = await api.get(`/vps-control/${svc}/automated-backup`);
+      return res.data?.automatedBackup as { rotation: number; schedule: string; state: string } | null;
+    },
+    enabled: !!svc,
+  });
+}

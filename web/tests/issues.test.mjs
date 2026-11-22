@@ -1,0 +1,1001 @@
+import { readFileSync } from "node:fs";
+import assert from "node:assert/strict";
+import { after, test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { createServer } from "vite";
+
+const server = await createServer({
+  configFile: false,
+  root: fileURLToPath(new URL("..", import.meta.url)),
+  resolve: { alias: { "@": fileURLToPath(new URL("../src", import.meta.url)) } },
+  server: { middlewareMode: true, hmr: false },
+  appType: "custom",
+});
+after(() => server.close());
+const { Route } = await server.ssrLoadModule("/src/routes/monitor.tsx");
+const { useServers } = await server.ssrLoadModule("/src/hooks/use-servers.ts");
+const { mergeStockPlans } = await server.ssrLoadModule("/src/lib/stock-plans.ts");
+const { Route: ServersRoute } = await server.ssrLoadModule("/src/routes/servers.tsx");
+const { hasStockWithOption } = await server.ssrLoadModule("/src/hooks/use-availability.ts");
+const { comparePrices } = await server.ssrLoadModule("/src/lib/money.ts");
+
+test("default account's configured subsidiary selects the price catalog", () => {
+  const client = new QueryClient();
+  client.setQueryData(["accounts", "list"], [{ id: "us", endpoint: "ovh-us", zone: "US", isDefault: true }]);
+  client.setQueryData(["servers", "list", { showApiServers: true, accountId: "" }], []);
+  try {
+    renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(ServersRoute.options.component)));
+    assert.ok(client.getQueryState(["ovh-catalog", "eco", "US"]));
+    assert.equal(client.getQueryState(["ovh-catalog", "eco", "IE"]), undefined);
+  } finally {
+    client.clear();
+  }
+});
+
+test("stock option indicators recognize display aliases without mixing datacenters", () => {
+  for (const [display, api] of [["mum", "ynm"], ["tor", "ca-east-tor-a"], ["par-a", "eu-west-par-a"]]) {
+    const variants = [{ fqn: "plan.ram-32g", datacenters: [{ datacenter: api, availability: "1H-low" }] }];
+    assert.equal(hasStockWithOption(variants, {}, "memory", "ram-32g", [display]), true);
+    assert.equal(hasStockWithOption(variants, {}, "memory", "ram-32g", ["par-b"]), false);
+  }
+});
+
+test("unknown prices stay last in either direction and zero is a valid price", () => {
+  const values = [undefined, 50, 0, NaN, 20];
+  assert.deepEqual([...values].sort((a, b) => comparePrices(a, b, "asc")).filter(Number.isFinite), [0, 20, 50]);
+  assert.deepEqual([...values].sort((a, b) => comparePrices(a, b, "desc")).filter(Number.isFinite), [50, 20, 0]);
+  for (const direction of ["asc", "desc"]) {
+    assert.ok(comparePrices(undefined, 50, direction) > 0);
+    assert.ok(comparePrices(0, undefined, direction) < 0);
+    assert.equal(comparePrices(undefined, NaN, direction), 0);
+  }
+});
+
+for (const catalogState of ["ready", "pending", "error"]) {
+  test(`server list includes 27skle01-v1 from stock with sales catalog ${catalogState}`, () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retryOnMount: false } } });
+    client.setQueryData(["accounts", "list"], [
+      { id: "eu", endpoint: "ovh-eu", zone: "IE", isDefault: true },
+    ]);
+    const key = ["servers", "list", { showApiServers: true, accountId: "" }];
+    if (catalogState === "ready") client.setQueryData(key, []);
+    if (catalogState === "error") {
+      client.getQueryCache().build(client, { queryKey: key }).setState({ status: "error", error: new Error("catalog unavailable") });
+    }
+    client.setQueryData(["availability", "all", "EU"], [{
+      planCode: "27skle01-v1", server: "27skle01", memory: "ram-16g-ddr3-noecc-1333",
+      storage: "softraid-2x480ssd", fqn: "27skle01-v1.ram-16g-ddr3-noecc-1333.softraid-2x480ssd",
+      datacenters: [{ datacenter: "gra", availability: "1H-high" }],
+    }]);
+    try {
+      const html = renderToStaticMarkup(createElement(QueryClientProvider, { client },
+        createElement(ServersRoute.options.component)));
+      assert.ok(html.includes("27skle01-v1"));
+      assert.match(html, /预上架|Prerelease/);
+      assert.ok(html.includes("16 GB"));
+      if (catalogState === "error") assert.ok(html.includes("catalog unavailable"));
+    } finally {
+      client.clear();
+    }
+  });
+}
+
+test("an unknown model's diagnostic does not crash the monitor page or hide deletion", () => {
+  const client = new QueryClient();
+  const planCode = "nonexistent-model";
+  const error = "EU 站点没有该型号的任何可用性记录";
+  client.setQueryData(["monitor", "list"], [{
+    planCode,
+    datacenters: [],
+    notifyAvailable: true,
+    notifyUnavailable: false,
+    lastStatus: {},
+    createdAt: "2026-10-19T00:00:00Z",
+  }]);
+  client.setQueryData(["monitor", "status"], {
+    running: true,
+    subscriptions_count: 1,
+    check_interval: 60,
+    known_servers_count: 0,
+    // The actual object shape returned by monitor.Status(), not a string.
+    region_issues: [{
+      planCode, serverName: "", accountId: "", region: "EU", subsidiary: "IE",
+      checkedAt: "2026-10-19T00:00:00Z", error,
+    }],
+  });
+  try {
+    const html = renderToStaticMarkup(createElement(QueryClientProvider, { client },
+      createElement(Route.options.component)));
+    assert.ok(html.includes(planCode));
+    assert.ok(html.includes(error));
+    assert.ok(html.includes("@ EU (IE)"));
+    assert.match(html, /aria-label="(?:删除|Delete)"/);
+  } finally {
+    client.clear();
+  }
+});
+
+for (const region_issues of [[], undefined]) {
+  test(`monitor page renders without diagnostics (${JSON.stringify(region_issues)})`, () => {
+    const client = new QueryClient();
+    client.setQueryData(["monitor", "list"], []);
+    client.setQueryData(["monitor", "status"], {
+      running: true, subscriptions_count: 0, check_interval: 60,
+      known_servers_count: 0, region_issues,
+    });
+    try {
+      const html = renderToStaticMarkup(createElement(QueryClientProvider, { client },
+        createElement(Route.options.component)));
+      assert.ok(!html.includes("border-warning/40 bg-warning/5"));
+    } finally {
+      client.clear();
+    }
+  });
+}
+
+test("task account override scopes the catalog cache to that account", () => {
+  const client = new QueryClient();
+  client.setQueryData(["accounts", "list"], [
+    { id: "eu-main", endpoint: "ovh-eu", zone: "IE", isDefault: true },
+    { id: "eu-second", endpoint: "ovh-eu", zone: "IE" },
+    { id: "us", endpoint: "ovh-us", zone: "US" },
+  ]);
+  function CatalogProbe({ accountId }) {
+    useServers(true, accountId);
+    return null;
+  }
+  try {
+    for (const accountId of ["eu-second", "us"]) {
+      renderToStaticMarkup(createElement(QueryClientProvider, { client },
+        createElement(CatalogProbe, { accountId })));
+      assert.ok(client.getQueryState(["servers", "list", { showApiServers: true, accountId }]));
+    }
+    assert.equal(client.getQueryState(["servers", "list", { showApiServers: true, accountId: "" }]), undefined);
+  } finally {
+    client.clear();
+  }
+});
+
+test("stock-only Eco models become searchable prereleases without replacing listed plans", () => {
+  const listed = { planCode: "24sk202", name: "KS-2", availableOptions: [] };
+  const stock = (planCode, memory = "ram-32g-ddr4-ecc-2666") => ({
+    planCode, server: planCode.replace(/-v1$/, ""), memory,
+    storage: "softraid-2x480ssd", fqn: `${planCode}.${memory}.softraid-2x480ssd`,
+    datacenters: [{ datacenter: "gra", availability: "1H-low" }],
+  });
+  const merged = mergeStockPlans([listed], [
+    stock("24sk202"), stock("27skle03-v1"), stock("27skle03-v1", "ram-64g-ddr4-ecc-2666"),
+    stock("27sysstorle01-v1"), stock("25scale01-v1"),
+  ]);
+  assert.equal(merged[0], listed);
+  assert.deepEqual(merged.map((p) => p.planCode), ["24sk202", "27skle03-v1", "27sysstorle01-v1"]);
+  const found = merged.find((p) => `${p.planCode} ${p.name}`.toLowerCase().includes("27SKLE03".toLowerCase()));
+  assert.equal(found.prerelease, true);
+  assert.ok(found.memory.includes("32") && found.memory.includes("64"));
+  assert.deepEqual(found.availableOptions.map(({ value, family }) => [value, family]), [
+    ["ram-32g-ddr4-ecc-2666", "memory"],
+    ["ram-64g-ddr4-ecc-2666", "memory"],
+    ["softraid-2x480ssd", "storage"],
+  ]);
+  assert.deepEqual(mergeStockPlans([listed]), [listed]);
+});
+
+test("all 12 API prerelease models expose every stock configuration without CPU or prices", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const stock = JSON.parse(await readFile(new URL("../../server/internal/purchase/testdata/preorder-stock.json", import.meta.url), "utf8"));
+  const { matchesServerSearch } = await server.ssrLoadModule("/src/lib/stock-plans.ts");
+  const { preorderVariantCoversAll } = await server.ssrLoadModule("/src/lib/preorder-options.ts");
+  const models = mergeStockPlans([], stock);
+  assert.equal(models.length, 12);
+  assert.equal(stock.length, 56);
+  for (const row of stock) {
+    const plan = models.find((model) => model.planCode === row.planCode);
+    assert.equal(plan.prerelease, true);
+    assert.equal(plan.cpu, "—");
+    assert.ok(plan.availableOptions.some((option) => option.value === row.memory));
+    assert.ok(plan.availableOptions.some((option) => option.value === row.storage));
+    assert.equal(preorderVariantCoversAll(row.fqn, [row.memory, row.storage]), true);
+  }
+  for (const [alias, code] of [["KS-LE-1", "27skle01-v1"], ["SYS-LE-2", "27sysle02-v1"], ["SYS-STOR-LE-1", "27sysstorle01-v1"], ["RISE-LE-3", "27risele03-v1"]]) {
+    assert.equal(models.find((model) => model.planCode === code).name, alias);
+    assert.ok(models.some((model) => model.planCode === code && matchesServerSearch(model, alias)));
+    assert.ok(models.some((model) => model.planCode === code && matchesServerSearch(model, alias.toLowerCase().replaceAll("-", " "))));
+  }
+});
+
+test("CPU and price publication retain preorder intent while exact RAM and disks stay unchanged", async () => {
+  const { preorderOptions, retainPreorderPlan, preorderVariantCoversAll } = await server.ssrLoadModule("/src/lib/preorder-options.ts");
+  const plan = "27skle03-v1";
+  let saved = retainPreorderPlan("", plan, true);
+  saved = retainPreorderPlan(saved, plan, false);
+  assert.equal(saved, plan, "publishing CPU/pricing must not turn this into an ordinary order");
+  assert.equal(retainPreorderPlan(saved, "27skle04-v1", false), "");
+  const options = ["ram-32g-ddr4-ecc-2666", "hybridsoftraid-2x8000sa-2x480ssd"];
+  assert.deepEqual(preorderOptions(["CPU-unpublished", ...options, "fixed-cpu-old"], ["fixed-cpu-old"]), options);
+  const fqn = `${plan}.${options.join(".")}`;
+  assert.equal(preorderVariantCoversAll(fqn, options), true);
+  assert.equal(preorderVariantCoversAll(fqn, ["ram-32g-ddr4-ecc-2400", options[1]]), false);
+  assert.equal(preorderVariantCoversAll(fqn, [options[0], "softraid-2x480ssd"]), false);
+});
+
+test("preorder option labels retain DDR, ECC, frequency and every disk group", async () => {
+  const { describeOptionCode } = await server.ssrLoadModule("/src/lib/option-groups.ts");
+  assert.equal(describeOptionCode("ram-16g-ddr3-noecc-1333"), "16 GB · DDR3 · Non-ECC · 1333 MHz");
+  assert.equal(describeOptionCode("ram-32g-ddr4-ecc-2666"), "32 GB · DDR4 · ECC · 2666 MHz");
+  for (const [code, first, second] of [
+    ["hybridsoftraid-2x8000sa-2x480ssd", "2× 8TB HDD", "2× 480GB SSD"],
+    ["hybridsoftraid-4x12000sa-1x512nvme", "4× 12TB HDD", "1× 512GB NVMe"],
+    ["softraid-2x480ssd-2x8000sa-27skle03-v1", "2× 480GB SSD", "2× 8TB HDD"],
+  ]) {
+    const label = describeOptionCode(code);
+    assert.ok(label.includes(first) && label.includes(second), label);
+  }
+});
+
+
+test("coupon and quantity scope are sent in one atomic queue request", async () => {
+  const { useCreateQueueItem } = await server.ssrLoadModule("/src/hooks/use-queue.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const client = new QueryClient();
+  const adapter = api.defaults.adapter;
+  const bodies = [];
+  api.defaults.adapter = async (config) => {
+    assert.equal(config.url, "/queue");
+    bodies.push(JSON.parse(config.data));
+    return { data: { count: JSON.parse(config.data).datacenters.length * JSON.parse(config.data).quantity }, status: 200, statusText: "OK", headers: {}, config };
+  };
+  let mutation;
+  function Probe() { mutation = useCreateQueueItem(); return null; }
+  try {
+    renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+    const result = await mutation.mutateAsync({ account_id: "eu", planCode: "24sk202", datacenters: ["gra", "rbx"], quantity: 2, options: ["ram-64g"], preorder: true, purchaseMode: "total", coupon: " Save10 " });
+    assert.equal(result.success, 4);
+    assert.equal(bodies.length, 1);
+    assert.deepEqual(bodies[0].datacenters, ["gra", "rbx"]);
+    assert.equal(bodies[0].quantity, 2);
+    assert.equal(bodies[0].purchaseMode, "total");
+    for (const body of bodies) {
+      assert.equal(body.coupon, "Save10");
+      assert.equal(body.autoPay, false);
+      assert.equal(body.preorder, true);
+      assert.deepEqual(body.options, ["ram-64g"]);
+    }
+    await mutation.mutateAsync({ account_id: "eu", planCode: "24sk202", datacenters: ["gra"], coupon: "  " });
+    assert.equal(bodies.at(-1).coupon, undefined);
+  } finally {
+    api.defaults.adapter = adapter;
+    client.clear();
+  }
+});
+
+
+test("successful history keeps coupon fallback visible in desktop and mobile views", async () => {
+  const { Route: HistoryRoute } = await server.ssrLoadModule("/src/routes/history.tsx");
+  const client = new QueryClient();
+  const warning = "优惠码未生效，本次未使用优惠码";
+  client.setQueryData(["history"], [{ id: "order", accountId: "eu", planCode: "24sk202", datacenter: "gra", status: "success", purchaseTime: "2026-10-23T00:00:00Z", couponWarning: warning }]);
+  client.setQueryData(["accounts", "list"], []);
+  try {
+    // 现在按容器宽度只渲染表格或紧凑列表其中一种,渲染出的那一种必须带着提示
+    const html = renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(HistoryRoute.options.component)));
+    assert.equal(html.split(warning).length - 1, 1);
+    // 表格行和紧凑行两种视图都保留优惠码提示
+    const source = readFileSync(new URL("../src/routes/history.tsx", import.meta.url), "utf8");
+    assert.equal(source.split("{item.couponWarning && ").length - 1, 2);
+  } finally {
+    client.clear();
+  }
+});
+
+test("task edits update one queue item and monitor edits retain exact empty configuration identity", async () => {
+  const { useUpdateQueueItem } = await server.ssrLoadModule("/src/hooks/use-queue.ts");
+  const { useUpdateMonitorSubscription, usePauseMonitorSubscription } = await server.ssrLoadModule("/src/hooks/use-monitor.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const client = new QueryClient();
+  const adapter = api.defaults.adapter;
+  const calls = [];
+  api.defaults.adapter = async (config) => {
+    calls.push({ method: config.method, url: config.url, params: config.params, body: JSON.parse(config.data) });
+    return { data: {}, status: 200, statusText: "OK", headers: {}, config };
+  };
+  let queue, monitor, pause;
+  function Probe() { queue = useUpdateQueueItem(); monitor = useUpdateMonitorSubscription(); pause = usePauseMonitorSubscription(); return null; }
+  try {
+    renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+    await queue.mutateAsync({ id: "task", datacenter: "rbx", options: ["ram-64g", "custom-addon"], retryInterval: 17, autoPay: false, coupon: "Save10", duration: "P12M" });
+    await monitor.mutateAsync({ planCode: "plan", optionsKey: "", notifyAvailable: false, options: ["ram-32g"] });
+    await pause.mutateAsync({ planCode: "plan", optionsKey: "", paused: true });
+    assert.equal(calls.length, 3);
+    assert.equal(calls[0].method, "put");
+    assert.equal(calls[0].url, "/queue/task");
+    assert.deepEqual(calls[0].body.options, ["ram-64g", "custom-addon"]);
+    assert.equal(calls[1].params.optionsKey, "");
+    assert.equal(calls[1].body.notifyAvailable, false);
+    assert.equal(calls[1].body.optionsKey, undefined);
+    assert.equal(calls[2].body.optionsKey, "");
+    assert.equal(calls[2].body.paused, true);
+  } finally { api.defaults.adapter = adapter; client.clear(); }
+});
+
+test("webhook tests cache actual delivery status on success and rejection without sending another probe", async () => {
+  const { useTestNotification } = await server.ssrLoadModule("/src/hooks/use-notify-channels.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const { AxiosError } = await import("axios");
+  const client = new QueryClient();
+  const adapter = api.defaults.adapter;
+  const key = ["notify", "channels", true];
+  let mutation, requestCount = 0, reject = false;
+  function Probe() { mutation = useTestNotification(); return null; }
+  api.defaults.adapter = async (config) => {
+    requestCount++;
+    assert.equal(config.method, "post");
+    assert.equal(config.url, "/monitor/test-notification");
+    const channels = [{ name: "Webhook", configured: true, ok: !reject, detail: reject ? "Webhook 返回错误 (code 19002): msg_type need" : "" }];
+    const response = { data: { channels, delivered: reject ? 0 : 1, message: "test result" }, status: reject ? 500 : 200, statusText: "fixture", headers: {}, config };
+    if (reject) throw new AxiosError("rejected", "ERR_BAD_RESPONSE", config, undefined, response);
+    return response;
+  };
+  try {
+    renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+    await mutation.mutateAsync();
+    assert.equal(requestCount, 1);
+    assert.equal(client.getQueryData(key).anyAvailable, true);
+    assert.equal(client.getQueryState(key).isInvalidated, false);
+    reject = true;
+    await assert.rejects(mutation.mutateAsync());
+    const result = client.getQueryData(key);
+    assert.equal(requestCount, 2);
+    assert.equal(result.verified, true);
+    assert.equal(result.anyAvailable, false);
+    assert.equal(result.channels[0].ok, false);
+    assert.match(result.channels[0].detail, /19002/);
+    assert.equal(client.getQueryState(key).isInvalidated, false);
+  } finally { api.defaults.adapter = adapter; client.clear(); }
+});
+
+// Payment is read-only until the user explicitly submits the mutation.
+test("payment preflight stays read-only and pins the account through submission", async () => {
+  const { useOrderPaymentInfo, usePayAccountOrder } = await server.ssrLoadModule("/src/hooks/use-account.ts");
+  const { OrderPaymentButton } = await server.ssrLoadModule("/src/components/account/OrderPaymentButton.tsx");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const client = new QueryClient();
+  const original = api.defaults.adapter;
+  const calls = [];
+  api.defaults.adapter = async (config) => {
+    calls.push(config);
+    return { data: { accountId: "original", orderId: 123, status: "notPaid", methods: [] }, status: 200, statusText: "OK", headers: {}, config };
+  };
+  let pay;
+  function Probe() { useOrderPaymentInfo("original", 123, false); pay = usePayAccountOrder("original", 123); return createElement(OrderPaymentButton, { accountId: "original", orderId: 123 }); }
+  try {
+    const html = renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+    assert.match(html, /发起支付|Pay order/);
+    assert.equal(calls.length, 0);
+    const query = client.getQueryCache().find({ queryKey: ["account", "order-payment", "original", 123] });
+    assert.equal(query.options.enabled, false);
+    await query.options.queryFn();
+    assert.equal(calls[0].method, "get");
+    assert.equal(calls[0].params.account, "original");
+    await pay.mutateAsync({ accountId: "original", paymentMethodId: 7, paymentType: "CREDIT_CARD", amount: 39.98, currency: "EUR", confirm: true });
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].method, "post");
+    assert.equal(calls[1].params.account, "original");
+    assert.deepEqual(JSON.parse(calls[1].data), { paymentMethodId: 7, paymentType: "CREDIT_CARD", amount: 39.98, currency: "EUR", confirm: true });
+  } finally { api.defaults.adapter = original; client.clear(); }
+});
+
+test("payment mutation does not retry ambiguous failures", async () => {
+  const { usePayAccountOrder } = await server.ssrLoadModule("/src/hooks/use-account.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const client = new QueryClient({ defaultOptions: { mutations: { retry: 3 } } });
+  const original = api.defaults.adapter;
+  let calls = 0, pay;
+  api.defaults.adapter = async () => { calls++; throw new Error("ambiguous result"); };
+  function Probe() { pay = usePayAccountOrder("account", 123); return null; }
+  try {
+    renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+    await assert.rejects(pay.mutateAsync({ accountId: "account", paymentMethodId: 7, paymentType: "CREDIT_CARD", amount: 39.98, currency: "EUR", confirm: true }), /ambiguous/);
+    assert.equal(calls, 1);
+  } finally { api.defaults.adapter = original; client.clear(); }
+});
+
+test("monitor displays saved last restock time and a truthful empty state", () => {
+  for (const lastRestockAt of ["2026-10-29T10:15:00Z", undefined]) {
+    const client = new QueryClient();
+    client.setQueryData(["monitor", "list"], [{ planCode: "24skstor01-v1", datacenters: ["gra"], notifyAvailable: true, notifyUnavailable: false, lastStatus: {}, createdAt: "2026-10-01T00:00:00Z", lastRestockAt }]);
+    client.setQueryData(["monitor", "status"], { running: false, subscriptions_count: 1, check_interval: 5, known_servers_count: 0 });
+    client.setQueryData(["accounts", "list"], []);
+    try {
+      const html = renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Route.options.component)));
+      assert.match(html, lastRestockAt ? /最近检测到补货|Last observed restock/ : /暂无历史补货记录|No restock observed/);
+      assert.match(html, /OVH/);
+    } finally { client.clear(); }
+  }
+});
+
+// 关联暂停改变了队列;保存失败也必须刷新真实内存状态,不能保留仍在抢购的旧显示。
+test("monitor pause refreshes queue and monitoring after success or persistence failure", async () => {
+  const { usePauseMonitorSubscription } = await server.ssrLoadModule("/src/hooks/use-monitor.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const original = api.defaults.adapter;
+  for (const fail of [false, true]) {
+    const client = new QueryClient();
+    const keys = [["monitor", "list"], ["monitor", "status"], ["queue", "list"]];
+    keys.forEach((key) => client.setQueryData(key, []));
+    api.defaults.adapter = async (config) => {
+      if (fail) throw new Error("pause persistence failure");
+      return { data: { paused: true, pausedTasks: 2 }, status: 200, statusText: "OK", headers: {}, config };
+    };
+    let pause;
+    function Probe() { pause = usePauseMonitorSubscription(); return null; }
+    try {
+      renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+      const pending = pause.mutateAsync({ planCode: "plan", optionsKey: "", paused: true });
+      if (fail) await assert.rejects(pending, /persistence/); else await pending;
+      for (const key of keys) assert.equal(client.getQueryState(key).isInvalidated, true);
+    } finally { api.defaults.adapter = original; client.clear(); }
+  }
+});
+
+// 新增标签页采用当前账户的工单列表,页面挂载不能发出真实工单操作。
+test("support list renders account-scoped tickets without submitting", async () => {
+  const { SupportTickets } = await server.ssrLoadModule("/src/components/support/SupportTickets.tsx");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const client = new QueryClient();
+  client.setQueryData(["support", "list", "", 0, ""], { accountId: "eu", accountName: "EU fixture", items: [{ ticketId: 123, ticketNumber: 987654, subject: "Disk issue", state: "open", category: "incident", product: "dedicated" }], page: 0, hasMore: false, failedCount: 0 });
+  const original = api.defaults.adapter;
+  let calls = 0;
+  api.defaults.adapter = async () => { calls++; throw new Error("unexpected request"); };
+  try {
+    const html = renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(SupportTickets)));
+    assert.match(html, /客服工单|Support tickets/);
+    assert.match(html, /新建工单|New ticket/);
+    assert.match(html, /987654/);
+    assert.match(html, /Disk issue/);
+    assert.equal(calls, 0);
+  } finally { api.defaults.adapter = original; client.clear(); }
+});
+
+// 类别、产品、子类别和服务名称均传给后端,操作账户在窗口打开时即固定。
+test("support mutations preserve selected classifications and the pinned account", async () => {
+  const { useCreateSupportTicket, useSupportAction } = await server.ssrLoadModule("/src/hooks/use-support.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const client = new QueryClient();
+  const original = api.defaults.adapter;
+  const calls = [];
+  api.defaults.adapter = async (config) => { calls.push(config); return { data: { accountId: "eu", result: { ticketId: 123, ticketNumber: 987654 } }, status: 200, statusText: "OK", headers: {}, config }; };
+  let create, action;
+  function Probe() { create = useCreateSupportTicket("eu"); action = useSupportAction("eu", 123); return null; }
+  try {
+    renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+    await create.mutateAsync({ subject: "Disk issue", body: "Line 1\n\nLine 2", category: "incident", product: "dedicated", subcategory: "down", serviceName: "ns-fixture" });
+    const body = JSON.parse(calls[0].data);
+    assert.equal(body.category, "incident");
+    assert.equal(body.product, "dedicated");
+    assert.equal(body.subcategory, "down");
+    assert.equal(body.serviceName, "ns-fixture");
+    assert.equal(body.body, "Line 1\n\nLine 2");
+    await action.mutateAsync({ action: "reply", body: "Follow-up" });
+    await action.mutateAsync({ action: "close" });
+    await action.mutateAsync({ action: "reopen", body: "Still unresolved" });
+    for (const call of calls) assert.equal(call.params.account, "eu");
+    assert.deepEqual(calls.slice(1).map((call) => call.url), Array(3).fill("/ovh/support/tickets/123"));
+    assert.equal(calls.length, 4);
+  } finally { api.defaults.adapter = original; client.clear(); }
+});
+
+// 真实对外通信失败时不自动重试,避免重复创建或回复。
+test("support create and reply do not retry ambiguous errors", async () => {
+  const { useCreateSupportTicket, useSupportAction } = await server.ssrLoadModule("/src/hooks/use-support.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const client = new QueryClient({ defaultOptions: { mutations: { retry: 3 } } });
+  const original = api.defaults.adapter;
+  let calls = 0, create, action;
+  api.defaults.adapter = async () => { calls++; throw new Error("unknown outcome"); };
+  function Probe() { create = useCreateSupportTicket("eu"); action = useSupportAction("eu", 123); return null; }
+  try {
+    renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+    await assert.rejects(create.mutateAsync({ subject: "x", body: "x", category: "assistance", product: "vps" }), /unknown/);
+    assert.equal(calls, 1);
+    await assert.rejects(action.mutateAsync({ action: "reply", body: "x" }), /unknown/);
+    assert.equal(calls, 2);
+  } finally { api.defaults.adapter = original; client.clear(); }
+});
+
+// 显式空账户代表默认账户,不能在请求拦截时被后来的全局账户切换覆盖。
+test("explicit default account remains pinned when another account is active", async () => {
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const original = api.defaults.adapter;
+  const previousWindow = globalThis.window;
+  const accounts = [];
+  globalThis.window = { localStorage: { getItem: (key) => key === "ovh_active_server_control_account_id" ? "us" : null } };
+  api.defaults.adapter = async (config) => { accounts.push(config.params.account); return { data: {}, status: 200, statusText: "OK", headers: {}, config }; };
+  try {
+    await api.get("/ovh/support/tickets", { params: { account: "" } });
+    await api.get("/ovh/support/tickets", { params: { account: "eu" } });
+    await api.get("/ovh/support/tickets");
+    assert.deepEqual(accounts, ["", "eu", "us"]);
+  } finally { api.defaults.adapter = original; if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; }
+});
+
+// 搜索、账户和页码均进入查询键,不同筛选不能复用旧列表缓存。
+test("support subject search keeps filter and account scope before pagination", async () => {
+  const { useSupportTickets } = await server.ssrLoadModule("/src/hooks/use-support.ts");
+  const { qk } = await server.ssrLoadModule("/src/lib/query.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const client = new QueryClient();
+  const original = api.defaults.adapter;
+  const calls = [];
+  api.defaults.adapter = async (config) => { calls.push(config); return { data: { accountId: "us", items: [] }, status: 200, statusText: "OK", headers: {}, config }; };
+  let list;
+  function Probe() { list = useSupportTickets("us", 2, "open", "Disk issue"); return null; }
+  try {
+    renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+    await list.refetch();
+    assert.deepEqual(calls[0].params, { account: "us", page: 2, status: "open", subject: "Disk issue" });
+    assert.notDeepEqual(qk.support.list("us", 2, "open", "Disk issue"), qk.support.list("us", 2, "open", "Other issue"));
+    assert.notDeepEqual(qk.support.list("eu", 2, "open", "Disk issue"), qk.support.list("us", 2, "open", "Disk issue"));
+  } finally { api.defaults.adapter = original; client.clear(); }
+});
+
+// 聊天正文保持原文和换行,上游消息中的 HTML 只能作为文字显示。
+test("support conversation keeps plain text for both senders", async () => {
+  const { TicketMessage } = await server.ssrLoadModule("/src/components/support/TicketMessage.tsx");
+  for (const from of ["support", "customer"]) {
+    const html = renderToStaticMarkup(createElement(TicketMessage, { message: { messageId: 1, from, creationDate: "2026-10-30T01:00:00Z", body: "Please investigate.\n<script>alert('x')</script>" } }));
+    assert.match(html, /Please investigate\.\n/);
+    assert.match(html, /&lt;script&gt;/);
+    assert.doesNotMatch(html, /<script>/);
+    assert.match(html, from === "customer" ? /我方|You/ : /OVH 支持团队|OVH support/);
+  }
+});
+
+// 覆盖所有支持的语言、工单静态文案、官方枚举和后端错误码,防止新增提示漏接。
+test("support translations cover every app language and backend error code", async () => {
+  const { readFile, readdir } = await import("node:fs/promises");
+  const { default: i18n, SUPPORTED_LANGUAGES } = await server.ssrLoadModule("/src/i18n/index.ts");
+  const go = await readFile(new URL("../../server/internal/handlers/support.go", import.meta.url), "utf8");
+  const keys = new Set([...go.matchAll(/"(SUPPORT_\w+)"/g)].map((m) => `api.${m[1]}`));
+  const components = new URL("../src/components/support/", import.meta.url);
+  for (const file of await readdir(components)) {
+    const source = await readFile(new URL(file, components), "utf8");
+    for (const match of source.matchAll(/\bt\(\s*"((?:support|common)\.[^"]+)"/g)) keys.add(match[1]);
+  }
+  for (const [name, group] of [["supportCategories", "categories"], ["supportProducts", "products"], ["supportSubcategories", "subcategories"]]) {
+    const choices = go.match(new RegExp(`var ${name} = \\[\\]string\\{([^}]+)\\}`))[1];
+    for (const value of choices.matchAll(/"([^"]+)"/g)) keys.add(`support.${group}.${value[1]}`);
+  }
+  for (const lang of SUPPORTED_LANGUAGES) {
+    for (const key of keys) {
+      assert.equal(i18n.exists(key, { lng: lang, fallbackLng: false }), true, `${lang}: missing ${key}`);
+      const text = i18n.t(key, { lng: lang });
+      assert.ok(text && text !== key, `${lang}: empty ${key}`);
+      if (lang === "en") assert.doesNotMatch(text, /\p{Script=Han}/u, `${key} leaks Chinese`);
+    }
+  }
+  // 英文是工单内容偏好,界面语言切换不会把填写示例翻译成中文。
+  for (const field of ["subjectPlaceholder", "bodyPlaceholder", "replyPlaceholder", "reopenPlaceholder"]) {
+    assert.equal(i18n.t(`support.${field}`, { lng: "zh" }), i18n.t(`support.${field}`, { lng: "en" }));
+  }
+});
+
+// 错误翻译保留上游原文,且列表中的单条错误跟随切换而不是缓存译文。
+test("support errors and partial rows update with language while keeping OVH details", async () => {
+  const { default: i18n } = await server.ssrLoadModule("/src/i18n/index.ts");
+  const { apiMessage, bodyMessage } = await server.ssrLoadModule("/src/lib/api-error.ts");
+  const { SupportTickets } = await server.ssrLoadModule("/src/components/support/SupportTickets.tsx");
+  const originalLanguage = i18n.language;
+  const client = new QueryClient();
+  const failure = { error: "中文默认错误", code: "SUPPORT_REQUEST_FAILED", params: { detail: "OVH 403 Fixture rejection (query: fixture-123)" } };
+  client.setQueryData(["support", "list", "", 0, ""], { accountId: "eu", accountName: "Fixture", items: [{ ticketId: 124, ...failure }], page: 0, hasMore: false, failedCount: 1 });
+  try {
+    for (const lang of ["en", "zh"]) {
+      await i18n.changeLanguage(lang);
+      const message = apiMessage({ response: { data: { error: "fallback", code: "SUPPORT_SUBMISSION_UNCONFIRMED", params: failure.params } } });
+      assert.match(message, lang === "en" ? /before sending again/ : /避免重复发送/);
+      assert.ok(message.includes(failure.params.detail));
+      assert.equal(apiMessage({ response: { data: { error: "Vendor original", code: "FUTURE_CODE" } } }), "Vendor original");
+      assert.equal(bodyMessage({ message: "Legacy message" }), "Legacy message");
+      const html = renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(SupportTickets)));
+      assert.ok(html.includes(failure.params.detail));
+      assert.doesNotMatch(html, /中文默认错误/);
+      assert.match(html, lang === "en" ? /ticket request failed/ : /工单请求失败/);
+    }
+  } finally { await i18n.changeLanguage(originalLanguage); client.clear(); }
+});
+
+// OVH 工单账户的凭据失效是业务错误,不能清除控制台会话或触发登录覆盖层。
+test("OVH support 401 does not expire the application session", async () => {
+  const { api, onAuthFailure } = await server.ssrLoadModule("/src/lib/api.ts");
+  const original = api.defaults.adapter;
+  let expired = 0;
+  const unregister = onAuthFailure(() => { expired++; });
+  const error = Object.assign(new Error("OVH credential rejection"), { response: { status: 401, data: { success: false, code: "SUPPORT_REQUEST_FAILED", error: "OVH credential rejection", params: { detail: "OVH 401" } } } });
+  api.defaults.adapter = async () => { throw error; };
+  try {
+    await assert.rejects(api.get("/ovh/support/tickets", { params: { account: "eu" } }), /credential rejection/);
+    assert.equal(expired, 0);
+  } finally { unregister(); api.defaults.adapter = original; }
+});
+
+// 完成记录仍属于总任务数,运行筛选同时计算待执行任务,避免数量变化让用户误认为丢单。
+test("queue status summary retains ordered tasks and accurate active counts", async () => {
+  const { QueueStatusFilter } = await server.ssrLoadModule("/src/components/queue/QueueStatusFilter.tsx");
+  const { default: i18n } = await server.ssrLoadModule("/src/i18n/index.ts");
+  const original = i18n.language;
+  try {
+    await i18n.changeLanguage("en");
+    const items = ["running", "pending", "paused", "completed", "completed", "failed"].map((status, n) => ({ id: String(n), status }));
+    const html = renderToStaticMarkup(createElement(QueueStatusFilter, { items, value: "all", onChange() {} }));
+    assert.match(html, /All tasks<\/span><span[^>]*>6/);
+    assert.match(html, /Running<\/span><span[^>]*>2/);
+    assert.match(html, /Ordered<\/span><span[^>]*>2/);
+    assert.match(html, /will not purchase again/);
+  } finally { await i18n.changeLanguage(original); }
+});
+
+// 切换默认账户或修改区域/凭据后,不能继续使用旧账户目录、订单、资源和工单缓存。
+test("account changes invalidate every account-scoped resource", async () => {
+  const { useSetDefaultAccount, useUpdateAccount } = await server.ssrLoadModule("/src/hooks/use-accounts.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const roots = ["servers", "availability", "server-control", "vps-control", "account", "support", "catalog", "ovh-catalog"];
+  const original = api.defaults.adapter;
+  api.defaults.adapter = async (config) => ({ data: { valid: true, account: { id: "eu" } }, status: 200, statusText: "OK", headers: {}, config });
+  try {
+    for (const operation of ["default", "update"]) {
+      const client = new QueryClient(); let change, update;
+      function Probe() { change = useSetDefaultAccount(); update = useUpdateAccount(); return null; }
+      roots.forEach((root) => client.setQueryData([root, "fixture"], []));
+      renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+      if (operation === "default") await change.mutateAsync("eu"); else await update.mutateAsync({ id: "eu", input: { zone: "FR" } });
+      for (const root of roots) assert.equal(client.getQueryState([root, "fixture"]).isInvalidated, true, root);
+      client.clear();
+    }
+  } finally { api.defaults.adapter = original; }
+});
+
+// 默认账户也固定为实际 ID,请求开始前全局账户切换不会把另一账户数据写进旧查询键。
+test("account readers pin the resolved default account through request dispatch", async () => {
+  const { useAccountInfo, useEmails, useRefunds } = await server.ssrLoadModule("/src/hooks/use-account.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const client = new QueryClient();
+  client.setQueryData(["accounts", "list"], [{ id: "eu", isDefault: true }]);
+  const original = api.defaults.adapter, originalWindow = globalThis.window;
+  let active = "";
+  globalThis.window = { localStorage: { getItem: () => active } };
+  const calls = [];
+  api.defaults.adapter = async (config) => { calls.push(config); return { data: [], status: 200, statusText: "OK", headers: {}, config }; };
+  let readers;
+  function Probe() { readers = [useAccountInfo(), useEmails(), useRefunds()]; return null; }
+  try {
+    renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+    active = "us";
+    await Promise.all(readers.map((reader) => reader.refetch()));
+    assert.equal(calls.length, 3);
+    assert.deepEqual(calls.map((call) => call.params.account), ["eu", "eu", "eu"]);
+  } finally { api.defaults.adapter = original; client.clear(); if (originalWindow === undefined) delete globalThis.window; else globalThis.window = originalWindow; }
+});
+
+// 官方窗口固定实际账户,返回值只保留身份摘要,一次性认证链接不进入缓存。
+test("official chat pins account and only navigates to the official endpoint", async () => {
+  const { authorizeOfficialChat } = await server.ssrLoadModule("/src/lib/official-chat.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const original = api.defaults.adapter;
+  let calls = 0, destination;
+  api.defaults.adapter = async (config) => {
+    calls++; assert.equal(config.params.account, "eu");
+    assert.deepEqual(JSON.parse(config.data), { product: "dedicated" });
+    return { data: { accountId: "eu", accountName: "EU fixture", customerCode: "fixture-eu", launchUrl: "https://agent-chat.ovhcloud.com/sn_va_web_client_app_embed.do?sysparm_queue=dedicated&sysparm_session_id=fictional-token" }, status: 200, statusText: "OK", headers: {}, config };
+  };
+  try {
+    const identity = await authorizeOfficialChat("eu", "dedicated", { closed: false, location: { replace(url) { destination = url; } } }, new AbortController().signal);
+    assert.deepEqual(identity, { accountName: "EU fixture", customerCode: "fixture-eu" });
+    assert.match(destination, /^https:\/\/agent-chat\.ovhcloud\.com\//);
+    assert.equal(calls, 1);
+    assert.equal("launchUrl" in identity, false);
+  } finally { api.defaults.adapter = original; }
+});
+
+// 跨账户响应、任意跳转或已关闭窗口,都不能把一次性链接导航到错误的窗口。
+test("official chat rejects mismatched accounts and unsafe URLs", async () => {
+  const { authorizeOfficialChat } = await server.ssrLoadModule("/src/lib/official-chat.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const original = api.defaults.adapter;
+  const base = { accountId: "eu", accountName: "EU fixture", customerCode: "fixture-eu", launchUrl: "https://agent-chat.ovhcloud.com/sn_va_web_client_app_embed.do?sysparm_queue=dedicated&sysparm_session_id=fictional-token" };
+  try {
+    for (const change of [
+      { accountId: "us" }, { launchUrl: "https://example.invalid/?token=fictional-token" },
+      { launchUrl: "https://agent-chat.ovhcloud.com/wrong-path" }, { launchUrl: "malformed" },
+      { launchUrl: base.launchUrl.replace("dedicated", "vps") }, { customerCode: "" },
+    ]) {
+      api.defaults.adapter = async (config) => ({ data: { ...base, ...change }, status: 200, statusText: "OK", headers: {}, config });
+      const target = { closed: false, location: { replace() { assert.fail("unsafe navigation"); } } };
+      await assert.rejects(authorizeOfficialChat("eu", "dedicated", target, new AbortController().signal), /CHAT_INVALID_RESPONSE/);
+    }
+    api.defaults.adapter = async (config) => ({ data: base, status: 200, statusText: "OK", headers: {}, config });
+    assert.equal(await authorizeOfficialChat("eu", "dedicated", { closed: true, location: { replace() { assert.fail("closed window navigated"); } } }, new AbortController().signal), null);
+  } finally { api.defaults.adapter = original; }
+});
+
+// 切换账户后取消旧请求,迟到的 EU 认证不能打开 US 会话。
+test("cancelled chat authentication cannot navigate a late response", async () => {
+  const { authorizeOfficialChat } = await server.ssrLoadModule("/src/lib/official-chat.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const original = api.defaults.adapter, controller = new AbortController();
+  let release, started;
+  const ready = new Promise((resolve) => { started = resolve; });
+  api.defaults.adapter = (config) => new Promise((resolve) => {
+    release = () => resolve({ data: { accountId: "eu", customerCode: "fixture-eu", launchUrl: "https://agent-chat.ovhcloud.com/sn_va_web_client_app_embed.do?sysparm_queue=dedicated&sysparm_session_id=fictional-token" }, status: 200, statusText: "OK", headers: {}, config });
+    started();
+  });
+  try {
+    const pending = authorizeOfficialChat("eu", "dedicated", { closed: false, location: { replace() { assert.fail("late navigation"); } } }, controller.signal);
+    const rejected = assert.rejects(pending, (error) => error.code === "ERR_CANCELED");
+    await ready; controller.abort(); release(); await rejected;
+  } finally { api.defaults.adapter = original; }
+});
+
+// 危险操作的确认与账户必须由弹窗传入,失败不自动重发。
+test("rescue and withdrawal mutations pin account, intent, recipient and reviewed order", async () => {
+  const { useEnterRescue, useExitRescue, useRequestRetraction } = await server.ssrLoadModule("/src/hooks/use-server-control.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const original = api.defaults.adapter;
+  const client = new QueryClient({ defaultOptions: { mutations: { retry: 3 } } });
+  const calls = [];
+  let fail = false, enter, exit, retract;
+  api.defaults.adapter = async config => {
+    calls.push(config);
+    if (fail) throw new Error("ambiguous operation response");
+    return { data: { success: true }, status: 200, statusText: "OK", headers: {}, config };
+  };
+  function Probe() { enter = useEnterRescue("ns-fixture", "eu"); exit = useExitRescue("ns-fixture", "eu"); retract = useRequestRetraction("ns-fixture", "eu"); return null; }
+  try {
+    renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+    await enter.mutateAsync({ email: "complete@example.com", useDefaultEmail: false, expectedBoot: 1, confirm: true });
+    await exit.mutateAsync({ expectedBoot: 2, confirm: true });
+    await retract.mutateAsync({ orderId: 123, confirm: true });
+    for (const call of calls) assert.equal(call.params.account, "eu");
+    assert.deepEqual(JSON.parse(calls[0].data), { email: "complete@example.com", useDefaultEmail: false, expectedBoot: 1, confirm: true });
+    assert.deepEqual(JSON.parse(calls[1].data), { expectedBoot: 2, confirm: true });
+    assert.deepEqual(JSON.parse(calls[2].data), { orderId: 123, confirm: true, reason: "other" });
+    fail = true;
+    await assert.rejects(retract.mutateAsync({ orderId: 123, confirm: true }), /ambiguous/);
+    await assert.rejects(enter.mutateAsync({ email: "complete@example.com", useDefaultEmail: false, expectedBoot: 1, confirm: true }), /ambiguous/);
+    await assert.rejects(exit.mutateAsync({ expectedBoot: 2, confirm: true }), /ambiguous/);
+    assert.equal(calls.length, 6);
+  } finally { api.defaults.adapter = original; client.clear(); }
+});
+
+// 网络写出须有真实回调才显示数字;中英文都标明预装与连接复用,不能把未写入当作 0µs 成绩。
+test("queue dispatch timings render only observed writes in both languages", async () => {
+  const { QueueRow } = await server.ssrLoadModule("/src/routes/queue.tsx");
+  const { default: i18n } = await server.ssrLoadModule("/src/i18n/index.ts");
+  const original = i18n.language;
+  const client = new QueryClient();
+  try {
+    for (const language of ["zh", "en"]) {
+      await i18n.changeLanguage(language);
+      for (const wrote of [false, true]) {
+        const html = renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(QueueRow, {
+          item: { id: "warm", accountId: "eu", planCode: "plan", datacenter: "gra", options: [], status: "running", createdAt: "2026-11-03T00:00:00Z", retryCount: 0, retryInterval: 60 },
+          timing: { at: "2026-11-03T00:00:00Z", totalMs: 5, phases: [], outcome: "unavailable", dispatch: { wroteRequest: wrote, detectionToWriteUs: 123, connectionReused: true, prewarmed: true } },
+          selected: false, onSelect() {}, onEdit() {}, onToggle() {}, onDelete() {},
+        })));
+        assert.equal(/123 µs/.test(html), wrote);
+        if (wrote) assert.match(html, language === "zh" ? /命中预装购物车.*复用连接/ : /Prebuilt cart reused.*Connection reused/);
+      }
+    }
+  } finally { await i18n.changeLanguage(original); client.clear(); }
+});
+
+test("service details and mutations remain scoped to the account that owns the view", async () => {
+  const { useServerServiceInfo } = await server.ssrLoadModule("/src/hooks/use-server-control.ts");
+  const { useUpdateVpsRenewal } = await server.ssrLoadModule("/src/hooks/use-vps-control.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const original = api.defaults.adapter;
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const euKey = ["server-control", "service-info", "same-service", { accountId: "eu" }];
+  const usKey = ["server-control", "service-info", "same-service", { accountId: "us" }];
+  const calls = [];
+  let mutation;
+  api.defaults.adapter = async config => {
+    calls.push(config);
+    return { data: { success: true }, status: 200, statusText: "OK", headers: {}, config };
+  };
+  function Probe() {
+    const info = useServerServiceInfo("same-service");
+    mutation = useUpdateVpsRenewal("same-service");
+    return createElement("span", null, info.data?.status || "loading");
+  }
+  try {
+    client.setQueryData(["accounts", "list"], [{ id: "eu", isDefault: true }, { id: "us" }]);
+    client.setQueryData(euKey, { status: "eu-only" });
+    assert.match(renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe))), /eu-only/);
+    // An operation created for EU must retain that account after the selected default changes.
+    client.setQueryData(["accounts", "list"], [{ id: "eu" }, { id: "us", isDefault: true }]);
+    await mutation.mutateAsync({ mode: "manual" });
+    assert.equal(calls[0].params.account, "eu");
+    const html = renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+    assert.ok(html.includes("loading") && !html.includes("eu-only"));
+    assert.ok(client.getQueryState(usKey));
+    assert.ok(client.getQueryData(euKey));
+  } finally { api.defaults.adapter = original; client.clear(); }
+});
+
+test("OS template storage is account-scoped and rejects malformed responses", async () => {
+  const { useServerTemplates } = await server.ssrLoadModule("/src/hooks/use-server-control.ts");
+  const { api } = await server.ssrLoadModule("/src/lib/api.ts");
+  const originalAdapter = api.defaults.adapter;
+  const originalStorage = globalThis.localStorage;
+  const entries = new Map([
+    ["ovh_sniper_templates_same-service", JSON.stringify([{ templateName: "legacy-other-account" }])],
+    ['ovh_sniper_templates_["eu","same-service"]', JSON.stringify([{ templateName: "eu-only" }])],
+    ['ovh_sniper_templates_["us","same-service"]', JSON.stringify({ invalid: true })],
+  ]);
+  globalThis.localStorage = { getItem: key => entries.get(key) ?? null, setItem: (key, value) => entries.set(key, value) };
+  const client = new QueryClient();
+  api.defaults.adapter = async config => ({ data: { templates: {} }, status: 200, statusText: "OK", headers: {}, config });
+  function Probe() {
+    const query = useServerTemplates("same-service", false);
+    return createElement("span", null, query.data?.map(item => item.templateName).join(",") || "loading");
+  }
+  try {
+    client.setQueryData(["accounts", "list"], [{ id: "eu", isDefault: true }, { id: "us" }]);
+    assert.match(renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe))), /eu-only/);
+    client.setQueryData(["accounts", "list"], [{ id: "eu" }, { id: "us", isDefault: true }]);
+    const html = renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(Probe)));
+    assert.ok(html.includes("loading") && !html.includes("eu-only") && !html.includes("legacy-other-account"));
+    const query = client.getQueryCache().find({ queryKey: ["server-control", "os-templates", "same-service", { accountId: "us" }] });
+    await assert.rejects(query.options.queryFn(), /模板列表响应格式错误|Invalid OS template response/);
+  } finally {
+    api.defaults.adapter = originalAdapter;
+    if (originalStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = originalStorage;
+    client.clear();
+  }
+});
+
+test("ambiguous checkout history is labeled as needing verification in both languages", async () => {
+  const { Route: HistoryRoute } = await server.ssrLoadModule("/src/routes/history.tsx");
+  const { default: i18n } = await server.ssrLoadModule("/src/i18n/index.ts");
+  const language = i18n.language;
+  const client = new QueryClient();
+  client.setQueryData(["history"], [{ id: "uncertain", accountId: "eu", planCode: "vps-fixture", datacenter: "DE", status: "uncertain", errorMessage: "Check the order in OVH", purchaseTime: "2026-11-03T00:00:00Z" }]);
+  try {
+    for (const lang of ["zh", "en"]) {
+      await i18n.changeLanguage(lang);
+      const html = renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(HistoryRoute.options.component)));
+      assert.match(html, lang === "zh" ? /待核对/ : /Needs verification/);
+      assert.ok(html.includes("vps-fixture"));
+    }
+  } finally { await i18n.changeLanguage(language); client.clear(); }
+});
+
+test("a delayed 401 cannot erase a newly entered API key", async () => {
+  const { api, onAuthFailure } = await server.ssrLoadModule("/src/lib/api.ts");
+  const originalAdapter = api.defaults.adapter, originalWindow = globalThis.window;
+  let key = "old-key", expired = 0, rejectResponse, entered;
+  const ready = new Promise(resolve => { entered = resolve; });
+  globalThis.window = { localStorage: { getItem: name => name === "ovh_sniper_api_key" ? key : null, removeItem: () => { key = null; } } };
+  const unregister = onAuthFailure(() => { expired++; });
+  api.defaults.adapter = config => new Promise((resolve, reject) => {
+    rejectResponse = () => reject(Object.assign(new Error("expired request"), { config, response: { status: 401, data: { code: "INVALID_API_KEY" } } }));
+    entered();
+  });
+  try {
+    const request = api.get("/ovh/account/info");
+    await ready;
+    key = "new-key";
+    rejectResponse();
+    await assert.rejects(request, /expired request/);
+    assert.equal(key, "new-key");
+    assert.equal(expired, 0);
+    api.defaults.adapter = async config => { throw Object.assign(new Error("current request rejected"), { config, response: { status: 401, data: { code: "INVALID_API_KEY" } } }); };
+    await assert.rejects(api.get("/ovh/account/info"), /current request rejected/);
+    assert.equal(expired, 1);
+    assert.equal(key, null);
+  } finally {
+    unregister(); api.defaults.adapter = originalAdapter;
+    if (originalWindow === undefined) delete globalThis.window; else globalThis.window = originalWindow;
+  }
+});
+
+test("prewarm identity includes account, payment and coupon while normalizing selection order", async () => {
+  const { prewarmIdentity } = await server.ssrLoadModule("/src/lib/order-prewarm.ts");
+  const request = { account_id: "eu", planCode: "plan", datacenters: ["mum", "bhs"], options: ["ram-32g", "storage"], quantity: 1, autoPay: false, coupon: "SAVE", preorder: false };
+  const key = prewarmIdentity(request);
+  assert.equal(key, prewarmIdentity({ ...request, datacenters: ["bhs", "ynm", "mum"], options: ["storage", "ram-32g", "storage"], coupon: " SAVE " }));
+  for (const change of [{ account_id: "us" }, { autoPay: true }, { coupon: "OTHER" }, { options: ["ram-64g"] }, { quantity: 2 }]) {
+    assert.notEqual(key, prewarmIdentity({ ...request, ...change }));
+  }
+});
+
+test("prewarm UI explains readiness, fallback and standby without ordering in both languages", async () => {
+  const { OrderPrewarm, StandbyCarts } = await server.ssrLoadModule("/src/components/queue/OrderPrewarm.tsx");
+  const { default: i18n } = await server.ssrLoadModule("/src/i18n/index.ts");
+  const language = i18n.language;
+  const client = new QueryClient();
+  client.setQueryData(["accounts", "list"], [{ id: "eu", name: "Europe" }]);
+  const status = { id: "web:unique-request", accountId: "eu", planCode: "KS-5", datacenters: ["bhs"], ready: 1, total: 1, state: "ready", standby: true, expiresAt: "2026-11-04T02:00:00Z" };
+  client.setQueryData(["purchase", "prewarm"], [status, { ...status, id: "monitor:hidden", planCode: "hidden" }]);
+  try {
+    for (const lang of ["zh", "en"]) {
+      await i18n.changeLanguage(lang);
+      const html = renderToStaticMarkup(createElement(OrderPrewarm, { preparation: { enabled: true, status, pin() {}, submitted() {} } }));
+      assert.match(html, lang === "zh" ? /购物车已就绪/ : /Carts ready/);
+      assert.match(html, lang === "zh" ? /确认创建抢购任务后才会下单/ : /Ordering starts after you confirm/);
+      assert.ok(html.includes('role="status"'));
+      const estimate = renderToStaticMarkup(createElement(OrderPrewarm, { preparation: { enabled: true, status: { ...status, estimated: true }, pin() {}, submitted() {} } }));
+      assert.match(estimate, lang === "zh" ? /无货期间按目录核价/ : /Priced from the catalog while out of stock/);
+      assert.doesNotMatch(html, /prewarm\.[a-z]/);
+      const waiting = renderToStaticMarkup(createElement(OrderPrewarm, { preparation: { enabled: true, error: "offline", pin() {}, submitted() {} } }));
+      assert.match(waiting, lang === "zh" ? /可以照常创建任务/ : /You can still create a task/);
+      const list = renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(StandbyCarts)));
+      assert.ok(list.includes("KS-5") && list.includes("Europe") && !list.includes("hidden"));
+      assert.match(list, lang === "zh" ? /取消 KS-5 的备车/ : /Discard standby carts for KS-5/);
+    }
+  } finally { await i18n.changeLanguage(language); client.clear(); }
+});
+
+const { durationMonths, supportsDuration } = await server.ssrLoadModule("/src/lib/order-duration.ts");
+const { OrderDurationField, OrderDurationLabel } = await server.ssrLoadModule("/src/components/queue/OrderDurationField.tsx");
+test("annual periods match aliases and cannot consume a monthly prewarm", async () => {
+  const { prewarmIdentity } = await server.ssrLoadModule("/src/lib/order-prewarm.ts");
+  const request = { account_id: "eu", planCode: "plan", datacenters: ["gra"], options: [], quantity: 1, autoPay: false, coupon: "", preorder: false };
+  assert.equal(durationMonths("P1Y"), 12);
+  assert.equal(supportsDuration(["P12M"], "P1Y"), true);
+  assert.equal(supportsDuration(["P1M"], "P12M"), false);
+  assert.equal(prewarmIdentity(request), prewarmIdentity({ ...request, duration: "P1M" }));
+  assert.notEqual(prewarmIdentity(request), prewarmIdentity({ ...request, duration: "P12M" }));
+});
+test("purchase period field labels and unsupported states work in both languages", async () => {
+  const { default: i18n } = await server.ssrLoadModule("/src/i18n/index.ts");
+  for (const [language, label, annual] of [["zh", "购买时长", "1 年"], ["en", "Purchase period", "1 year"]]) {
+    await i18n.changeLanguage(language);
+    assert.ok(renderToStaticMarkup(createElement(OrderDurationLabel, { value: "P12M" })).includes(annual));
+    const html = renderToStaticMarkup(createElement(OrderDurationField, { value: "P12M", onChange() {}, query: { data: ["P1M"], isFetching: false, isError: false } }));
+    assert.ok(html.includes(label));
+    assert.ok(html.includes('aria-invalid="true"'));
+    assert.ok(html.includes(i18n.t("orderDuration.unsupported")));
+    assert.ok(!html.includes("orderDuration."));
+  }
+});
+
+
+test("presale tasks require explicit RAM and complete disks, and scope labels work in both languages", async () => {
+  const { hasPreorderHardware } = await server.ssrLoadModule("/src/lib/preorder-options.ts");
+  const { OrderPurchaseScope } = await server.ssrLoadModule("/src/components/queue/OrderPurchaseScope.tsx");
+  const { default: i18n } = await server.ssrLoadModule("/src/i18n/index.ts");
+  assert.equal(hasPreorderHardware([]), false);
+  assert.equal(hasPreorderHardware(["ram-32g-ddr4-ecc-2400"]), false);
+  assert.equal(hasPreorderHardware(["ram-32g-ddr4-ecc-2400", "hybridsoftraid-2x8000sa-2x480ssd"]), true);
+  const original = i18n.language;
+  try {
+    for (const lang of ["zh", "en"]) {
+      await i18n.changeLanguage(lang);
+      const html = renderToStaticMarkup(createElement(OrderPurchaseScope, { id: "test-scope", value: "total", onChange() {} }));
+      assert.match(html, /for="test-scope"/);
+      assert.match(html, lang === "zh" ? /所选机房合计/ : /Total across selected datacenters/);
+      assert.doesNotMatch(html, /queue\.(scope|purchase)/);
+      for (const key of ["groupComplete", "groupUncertain", "phase.waitingQuote", "phase.waitingOptions", "phase.waitingQuota"]) assert.notEqual(i18n.t(`queue.${key}`), `queue.${key}`);
+    }
+  } finally { await i18n.changeLanguage(original); }
+});
+
+
+test("presale preparation timing phases are translated in tooltips", async () => {
+  const { TimingChip } = await server.ssrLoadModule("/src/components/common/TimingChip.tsx");
+  const { default: i18n } = await server.ssrLoadModule("/src/i18n/index.ts");
+  const original = i18n.language;
+  try {
+    for (const lang of ["zh", "en"]) {
+      await i18n.changeLanguage(lang);
+      const html = renderToStaticMarkup(createElement(TimingChip, { totalMs: 3, phases: [{ name: "复用已核验配置", ms: 2 }] }));
+      assert.match(html, lang === "zh" ? /复用已核验配置/ : /Reuse verified configuration/);
+      if (lang === "en") assert.doesNotMatch(html, /复用已核验配置/);
+    }
+  } finally { await i18n.changeLanguage(original); }
+});
