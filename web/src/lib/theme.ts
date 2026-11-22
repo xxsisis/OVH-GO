@@ -54,7 +54,7 @@ function applyResolved(resolved: ResolvedTheme) {
   // theme-color 跟背景同值,手机浏览器地址栏区域才不会在深色下泛白。
   // 与 index.html 内联脚本里的两个 hex 保持同步(那里无法读 CSS 变量)
   const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.setAttribute("content", resolved === "dark" ? "#0f0f0f" : "#ffffff");
+  if (meta) meta.setAttribute("content", resolved === "dark" ? "#211f1c" : "#f5f3ef");
 }
 
 export function applyTheme(mode: ThemeMode) {

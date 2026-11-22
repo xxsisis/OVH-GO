@@ -97,8 +97,8 @@ function Kpi({
   return (
     <Card
       className={cn(
-        "min-w-0 transition-[box-shadow,transform] hover:shadow-[var(--soft-2)] hover:-translate-y-px",
-        brand && "!bg-[#2f74ff] bg-gradient-to-br from-[#4c8dff] to-[#1f5fe6] text-white !shadow-[0_8px_20px_-6px_rgba(31,107,255,.55)]",
+        "min-w-0",
+        brand && "kpi-nameplate",
       )}
     >
       {to ? (
@@ -149,7 +149,7 @@ function MeterRing({ label, percent, detail }: { label: string; percent?: number
   const { t } = useTranslation();
   const known = typeof percent === "number" && Number.isFinite(percent);
   const p = known ? Math.max(0, Math.min(100, percent)) : 0;
-  const stroke = p >= 90 ? "var(--red)" : p >= 75 ? "#f5a524" : "var(--blue)";
+  const stroke = p >= 90 ? "var(--red)" : p >= 75 ? "hsl(var(--warning))" : "var(--blue)";
   const r = 24;
   const c = 2 * Math.PI * r;
   return (
@@ -320,8 +320,7 @@ export function DashboardPearl() {
       )}
 
       {/* 欢迎横幅:状态一句话 + 两个常用入口 + 插画 */}
-      <Card className="relative overflow-hidden">
-        <div className="absolute inset-0 bg-gradient-to-r from-primary/[0.10] via-primary/[0.04] to-transparent pointer-events-none" aria-hidden />
+      <Card className="dashboard-welcome relative overflow-hidden">
         <div className="relative flex items-center gap-6 px-5 py-5 sm:px-7 sm:py-6">
           <div className="min-w-0 flex-1">
             <h2 className="text-[19px] sm:text-[21px] font-semibold tracking-tight">{t(greetingKey(new Date().getHours()))}</h2>
