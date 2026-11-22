@@ -71,13 +71,12 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
+
       - name: 前端回归测试
         run: npm test
-      - name: TypeScript 类型检查
-        run: npx tsc -b --noEmit
-      - name: 构建
-        run: npm run build
 
+      - name: TypeScript 类型检查与构建
+        run: npm run build
   live-api:
     name: OVH 公开接口契约(允许失败)
     runs-on: ubuntu-latest

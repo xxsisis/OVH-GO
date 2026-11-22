@@ -2,9 +2,7 @@ package updater
 
 import "testing"
 
-// 容器检测错了后果是双向的：
-// 漏判 → 容器里给出一个点了必然失败（或者"成功"之后版本回滚）的更新按钮；
-// 误判 → 裸机用户的自更新被无故停掉。
+// 只测试环境变量的解析，不调用 InContainer，避免测试运行器自身的 Docker 环境影响结果。
 func TestInContainerEnvFlag(t *testing.T) {
 	cases := map[string]bool{
 		"1":     true,
@@ -17,7 +15,7 @@ func TestInContainerEnvFlag(t *testing.T) {
 	}
 	for v, want := range cases {
 		t.Setenv("OVH_IN_CONTAINER", v)
-		got := InContainer()
+		got := containerEnvEnabled()
 		// 空串和显式否定时会落到文件/cgroup 判据上，
 		// 本机跑测试时那些都不该命中
 		if want && !got {
@@ -31,7 +29,7 @@ func TestInContainerEnvFlag(t *testing.T) {
 
 // 更新指引必须把"为什么"说清楚，否则用户只会觉得功能坏了。
 func TestContainerUpdateHintIsActionable(t *testing.T) {
-	for _, must := range []string{"docker compose pull", "docker pull", "卷", "可写层"} {
+	for _, must := range []string{"docker compose up -d --build", "docker compose pull", "卷", "可写层"} {
 		if !contains(ContainerUpdateHint, must) {
 			t.Errorf("更新指引里缺少 %q", must)
 		}

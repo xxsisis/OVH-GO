@@ -18,9 +18,15 @@ import (
 //     会看到一个"换了个人"的主进程。
 //
 // 容器的更新方式只有一个：拉新镜像、重建容器。数据在卷上，不受影响。
+// containerEnvEnabled 判断环境变量是否明确声明运行在容器中。
+func containerEnvEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("OVH_IN_CONTAINER"))
+	return v != "" && v != "0" && !strings.EqualFold(v, "false")
+}
+
 func InContainer() bool {
 	// 我们自己的镜像里显式设了这个 —— 最可靠
-	if v := strings.TrimSpace(os.Getenv("OVH_IN_CONTAINER")); v != "" && v != "0" && !strings.EqualFold(v, "false") {
+	if containerEnvEnabled() {
 		return true
 	}
 	// Docker 会在容器根目录放这个文件
@@ -46,11 +52,10 @@ func InContainer() bool {
 
 // ContainerUpdateHint 容器里该怎么更新。给接口和界面用同一份说法。
 const ContainerUpdateHint = "检测到运行在容器里，自更新已停用。\n\n" +
-	"容器的更新方式是拉新镜像再重建容器：\n" +
-	"  docker compose pull && docker compose up -d\n" +
-	"或者：\n" +
-	"  docker build -t ovh-go:local .\n" +
-	"  docker rm -f ovh-console && docker run -d ... ovh-go:local\n\n" +
+	"如果使用本地源码和 Docker Compose：\n" +
+	"  docker compose up -d --build\n\n" +
+	"如果使用已经发布的 GHCR 镜像：\n" +
+	"  docker compose pull && docker compose up -d\n\n" +
 	"数据在挂载的卷上，重建容器不会丢。\n\n" +
 	"为什么不能在容器里自更新：新二进制只会写进容器的可写层，" +
 	"容器一重建就回到镜像里的旧版本 —— 你会看到「更新成功」之后版本号又变回去。"
